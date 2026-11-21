@@ -513,7 +513,7 @@ pub fn menu_item(ui: &mut Ui, label: &str) -> bool {
 }
 
 pub fn menu_item_colored(ui: &mut Ui, label: &str, color: Color32) -> bool {
-    let w = ui.available_width().max(190.0);
+    let w = ui.available_width().clamp(190.0, 240.0);
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 30.0), Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, 8.0, Color32::from_rgba_unmultiplied(32, 149, 242, 40));

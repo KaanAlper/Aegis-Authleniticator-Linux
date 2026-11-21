@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/KaanAlper/Aegis-Authleniticator-Linux/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KaanAlper/Aegis-Authleniticator-Linux?style=for-the-badge&color=2095f2&label=release"></a>
+  <a href="https://github.com/KaanAlper/Aegis-Authleniticator-Linux/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/KaanAlper/Aegis-Authleniticator-Linux?style=for-the-badge&color=2095f2&label=release&cacheSeconds=300"></a>
   <img alt="Rust" src="https://img.shields.io/badge/Rust-native-orange?style=for-the-badge&logo=rust&logoColor=white">
   <img alt="Wayland and X11" src="https://img.shields.io/badge/Wayland%20%2B%20X11-supported-1f2937?style=for-the-badge">
 </p>
@@ -33,8 +33,7 @@
 | **Speaks your language** | English, Türkçe, Deutsch, Français, Español, Italiano, Português, Русский, Polski — or follow the system language. |
 
 <p align="center">
-  <img src="assets/screenshots/light.png" alt="Light theme" width="49%" />
-  <img src="assets/screenshots/welcome.png" alt="Welcome screen" width="49%" />
+  <img src="assets/screenshots/showcase.png" alt="Aegis Authenticator for Linux — organized grid, right-click menu, light and dark themes, full control" width="880" />
 </p>
 
 ## Made for daily use
