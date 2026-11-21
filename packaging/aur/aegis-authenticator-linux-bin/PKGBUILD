@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc='Native Linux desktop client for Aegis Authenticator 2FA vaults (prebuilt AppImage)'
 arch=('x86_64')
 url='https://github.com/KaanAlper/Aegis-Authleniticator-Linux'
-license=('custom')
+license=('GPL-3.0-only')
 depends=('dbus' 'libxkbcommon' 'wayland' 'gtk3' 'libnotify' 'mesa' 'fuse2')
 optdepends=('wl-clipboard: most reliable clipboard on Wayland'
             'zbar: webcam QR scanning')

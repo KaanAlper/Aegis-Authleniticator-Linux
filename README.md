@@ -102,6 +102,10 @@ cargo build --release
 cargo test
 ```
 
+## License
+
+Released under the [GNU GPL v3](LICENSE).
+
 ## Credits
 
 [Aegis Authenticator](https://github.com/beemdevelopment/Aegis) is an Android app by Beem Development.
