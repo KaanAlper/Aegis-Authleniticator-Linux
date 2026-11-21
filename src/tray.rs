@@ -40,6 +40,31 @@ impl Default for SharedTrayState {
     }
 }
 
+/// Copies text to the clipboard; uses wl-copy on Wayland (reliable), arboard otherwise.
+pub fn set_clipboard(text: &str) {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        use std::io::Write;
+        use std::process::Stdio;
+        if let Ok(mut child) = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            let wrote = child
+                .stdin
+                .take()
+                .is_some_and(|mut i| i.write_all(text.as_bytes()).is_ok());
+            if wrote && child.wait().map(|s| s.success()).unwrap_or(false) {
+                return;
+            }
+        }
+    }
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
+}
+
 pub struct AegisTray {
     pub state: Arc<Mutex<SharedTrayState>>,
     pub tx: Sender<TrayCommand>,
@@ -105,7 +130,11 @@ impl Tray for AegisTray {
                 })]
             } else {
                 let now = current_unix_seconds();
-                entries
+                let mut entries = entries;
+                entries.sort_by_key(|e| {
+                    if e.issuer.is_empty() { e.name.to_lowercase() } else { e.issuer.to_lowercase() }
+                });
+                let flat: Vec<MenuItem<Self>> = entries
                     .into_iter()
                     .map(|entry| {
                         let icon_png = get_or_build_entry_png(&mut guard.icon_png_cache, &entry);
@@ -129,9 +158,7 @@ impl Tray for AegisTray {
                             activate: Box::new(move |tray: &mut Self| {
                                 let now = current_unix_seconds();
                                 if let Ok(raw_code) = generate_code_for_entry(&entry_clone, now) {
-                                    if let Ok(mut cb) = arboard::Clipboard::new() {
-                                        let _ = cb.set_text(raw_code.clone());
-                                    }
+                                    set_clipboard(&raw_code);
                                     let display_name = if entry_clone.issuer.is_empty() {
                                         entry_clone.name.clone()
                                     } else {
@@ -154,7 +181,41 @@ impl Tray for AegisTray {
                             ..Default::default()
                         })
                     })
-                    .collect()
+                    .collect();
+
+                // Long lists would run off the screen (the shell draws the menu), so
+                // split them into alphabetical pages.
+                const PAGE: usize = 12;
+                if flat.len() <= PAGE {
+                    flat
+                } else {
+                    let labels: Vec<char> = guard
+                        .entries
+                        .iter()
+                        .map(|e| {
+                            let t = if e.issuer.is_empty() { &e.name } else { &e.issuer };
+                            t.chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('#')
+                        })
+                        .collect();
+                    let mut sorted_labels = labels;
+                    sorted_labels.sort();
+                    let mut pages: Vec<MenuItem<Self>> = Vec::new();
+                    let mut start = 0usize;
+                    let mut iter = flat.into_iter().peekable();
+                    while iter.peek().is_some() {
+                        let chunk: Vec<MenuItem<Self>> = iter.by_ref().take(PAGE).collect();
+                        let end = start + chunk.len() - 1;
+                        let a = sorted_labels.get(start).copied().unwrap_or('#');
+                        let b = sorted_labels.get(end).copied().unwrap_or('#');
+                        pages.push(MenuItem::SubMenu(SubMenu {
+                            label: format!("{a} – {b}"),
+                            submenu: chunk,
+                            ..Default::default()
+                        }));
+                        start = end + 1;
+                    }
+                    pages
+                }
             };
 
             MenuItem::SubMenu(SubMenu {
@@ -310,5 +371,94 @@ fn build_wolf_tray_icon() -> Icon {
         width: 1,
         height: 1,
         data: vec![255, 16, 185, 129],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background tray mode
+//
+// Wayland has no way to hide a toplevel window, so "close to tray" works like
+// GTK apps do: the window is really closed and a tiny tray-only process stays
+// alive. "Show Aegis" starts a fresh window (the vault comes back locked).
+// ---------------------------------------------------------------------------
+
+fn pid_file() -> Option<std::path::PathBuf> {
+    dirs::runtime_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|d| d.join("aegis-linux-tray.pid"))
+}
+
+fn spawn_detached(args: &[&str]) {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn();
+    }
+}
+
+/// Starts the tray-only background process.
+pub fn start_background_tray() {
+    spawn_detached(&["--tray-only"]);
+}
+
+/// Stops a running tray-only process (if any). Called when a window starts.
+pub fn stop_background_tray() {
+    let Some(path) = pid_file() else { return };
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            let is_ours = std::fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|c| String::from_utf8_lossy(&c).contains("--tray-only"))
+                .unwrap_or(false);
+            if is_ours {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Runs the tray icon without any window until the user picks Show or Quit.
+pub fn run_tray_only() {
+    let config = crate::config::AppConfig::load();
+    let lang = config
+        .language
+        .as_deref()
+        .map(Lang::from_code)
+        .unwrap_or_else(Lang::detect_system);
+
+    if let Some(path) = pid_file() {
+        let _ = std::fs::write(path, std::process::id().to_string());
+    }
+
+    let state = Arc::new(Mutex::new(SharedTrayState {
+        is_locked: true,
+        entries: Vec::new(),
+        icon_png_cache: HashMap::new(),
+        lang,
+    }));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _handle = spawn_tray(state, tx, egui::Context::default());
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            TrayCommand::ShowWindow => {
+                if let Some(path) = pid_file() {
+                    let _ = std::fs::remove_file(path);
+                }
+                spawn_detached(&[]);
+                return;
+            }
+            TrayCommand::Quit => break,
+            _ => {}
+        }
+    }
+    if let Some(path) = pid_file() {
+        let _ = std::fs::remove_file(path);
     }
 }

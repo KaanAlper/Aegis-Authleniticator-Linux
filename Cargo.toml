@@ -1,6 +1,6 @@
 [package]
 name = "aegis-linux"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Linux desktop client for Aegis Authenticator vaults written in Rust"
 
@@ -20,7 +20,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
 uuid = { version = "1", features = ["v4"] }
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 rfd = "0.15"
 url = "2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use egui::{Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use uuid::Uuid;
 
-use crate::config::{AppConfig, SortMode};
+use crate::config::{adopt_vault_file, AppConfig, SortMode};
 use crate::i18n::{strings, Lang};
 use crate::otp::{
     current_unix_millis, current_unix_seconds, decode_qr_from_image, export_google_auth_migration,
@@ -17,11 +17,12 @@ use crate::otp::{
 };
 use crate::tray::{spawn_tray, AegisTray, SharedTrayState, TrayCommand};
 use crate::ui::widgets::{
-    draw_countdown_ring, draw_issuer_avatar, draw_toast, filter_pill, primary_button,
-    secondary_button, AEGIS_BLUE,
+    danger_button, draw_countdown_ring, draw_issuer_avatar, draw_toast, field_label, filter_pill,
+    fit_text, icon_button, menu_item, menu_item_colored, modal, paint_icon, primary_button,
+    secondary_button, segmented, tokens, Icon, AEGIS_AMBER, AEGIS_BLUE, AEGIS_RED,
 };
 use crate::vault::{
-    is_vault_file_encrypted, load_vault, EntryInfo, OtpType, UnlockedVault, VaultEntry,
+    is_vault_file_encrypted, load_vault, parse_vault_str, EntryInfo, OtpType, UnlockedVault, VaultEntry,
     VaultGroup,
 };
 
@@ -46,6 +47,19 @@ enum ExportFormat {
     WebHtml,
     TextTxt,
     GoogleAuth,
+}
+
+enum CardAction {
+    Copy(String, String),
+    ToggleFav(Vec<String>),
+    SetFav(Vec<String>, bool),
+    SetGroup(Vec<String>, String, bool),
+    HotpNext(String),
+    Edit(VaultEntry),
+    Delete(Vec<String>),
+    ToggleSelect(String),
+    SelectAll,
+    ClearSelection,
 }
 
 struct Toast {
@@ -242,7 +256,8 @@ pub struct AegisApp {
     security_modal_open: bool,
     sec_new_password: String,
     sec_confirm_password: String,
-    delete_confirm_uuid: Option<String>,
+    delete_confirm_ids: Vec<String>,
+    selected: std::collections::HashSet<String>,
 
     // Tray integration
     tray_state: Arc<Mutex<SharedTrayState>>,
@@ -256,11 +271,19 @@ pub struct AegisApp {
     settings_tab: SettingsTab,
     export_format: ExportFormat,
     last_activity: Instant,
+    scale_save_pending: bool,
+    sec_old_password: String,
+    export_encrypt: bool,
+    export_pwd: String,
+    export_pwd_confirm: String,
+    export_confirm_open: bool,
+    export_go: bool,
 }
 
 impl AegisApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config = AppConfig::load();
+        install_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, config.dark_mode);
 
         let mut pending_vault_path = None;
@@ -330,7 +353,8 @@ impl AegisApp {
             security_modal_open: false,
             sec_new_password: String::new(),
             sec_confirm_password: String::new(),
-            delete_confirm_uuid: None,
+            delete_confirm_ids: Vec::new(),
+            selected: std::collections::HashSet::new(),
             tray_state,
             tray_handle,
             tray_rx,
@@ -342,6 +366,13 @@ impl AegisApp {
             settings_tab: SettingsTab::Appearance,
             export_format: ExportFormat::AegisJson,
             last_activity: Instant::now(),
+            scale_save_pending: false,
+            sec_old_password: String::new(),
+            export_encrypt: true,
+            export_pwd: String::new(),
+            export_pwd_confirm: String::new(),
+            export_confirm_open: false,
+            export_go: false,
         };
 
         // If last vault is plaintext, auto-open it
@@ -382,6 +413,26 @@ impl AegisApp {
     }
 
     fn copy_to_clipboard(&mut self, text: &str, label: &str) {
+        // On Wayland prefer wl-copy: it keeps serving the selection after we return.
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            if let Ok(mut child) = Command::new("wl-copy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let wrote = child
+                    .stdin
+                    .take()
+                    .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+                if wrote && child.wait().map(|s| s.success()).unwrap_or(false) {
+                    self.show_toast(format!("Copied {label} to clipboard"), false);
+                    return;
+                }
+            }
+        }
         if let Some(cb) = &mut self.clipboard {
             match cb.set_text(text.to_string()) {
                 Ok(()) => self.show_toast(format!("Copied {label} to clipboard"), false),
@@ -422,6 +473,14 @@ impl AegisApp {
     fn try_open_vault(&mut self, path: PathBuf, password: Option<&str>) {
         match load_vault(&path, password) {
             Ok(vault) => {
+                // Embed the vault into app storage so it no longer depends on the original file.
+                let path = match adopt_vault_file(&path) {
+                    Ok(internal) => internal,
+                    Err(e) => {
+                        self.show_toast(format!("Could not copy vault into app storage: {e}"), true);
+                        path
+                    }
+                };
                 self.vault = Some(vault);
                 self.vault_path = Some(path.clone());
                 self.pending_vault_path = Some(path.clone());
@@ -555,17 +614,8 @@ impl AegisApp {
     fn render_unlock_screen(&mut self, ctx: &egui::Context) {
         let s = strings(self.lang);
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if secondary_button(ui, self.lang.short_label()).clicked() {
-                        self.lang = self.lang.toggle();
-                        self.config.language = Some(self.lang.code().to_string());
-                        self.config.save();
-                        self.sync_tray();
-                    }
-                });
-            });
-            let top_pad = ((ui.available_height() - 390.0) * 0.38).max(16.0);
+          egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let top_pad = ((ui.available_height() - 360.0) * 0.38).max(16.0);
             ui.vertical_centered(|ui| {
                 ui.add_space(top_pad);
 
@@ -575,25 +625,17 @@ impl AegisApp {
                 }
 
                 ui.label(RichText::new("Aegis Authenticator").size(26.0).strong());
-                ui.label(RichText::new(s.subtitle).size(13.0).weak());
-                ui.add_space(24.0);
+                ui.add_space(20.0);
 
-                let card_fill = if ui.visuals().dark_mode {
-                    Color32::from_rgb(20, 24, 35)
-                } else {
-                    Color32::WHITE
-                };
-                let card_stroke = if ui.visuals().dark_mode {
-                    egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 46, 65))
-                } else {
-                    egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 226, 236))
-                };
+                let ut = tokens(ui.visuals().dark_mode);
+                let card_fill = ut.card;
+                let card_stroke = egui::Stroke::new(1.0_f32, ut.border);
 
                 egui::Frame::NONE
                     .fill(card_fill)
                     .stroke(card_stroke)
                     .inner_margin(egui::Margin::same(28))
-                    .corner_radius(16.0)
+                    .corner_radius(22.0)
                     .shadow(egui::Shadow {
                         offset: [0, 8],
                         blur: 24,
@@ -601,7 +643,7 @@ impl AegisApp {
                         color: Color32::from_black_alpha(60),
                     })
                     .show(ui, |ui| {
-                        ui.set_width(380.0);
+                        ui.set_width(380.0_f32.min((ui.ctx().screen_rect().width() - 100.0).max(220.0)));
 
                         if self.creating_new_vault {
                             ui.label(RichText::new(s.create_vault_title).size(18.0).strong());
@@ -701,7 +743,7 @@ impl AegisApp {
                             }
 
                             ui.add_space(16.0);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if primary_button(ui, s.unlock_btn).clicked() {
                                     let pwd = self.unlock_password.clone();
                                     let pwd_opt = if self.pending_encrypted {
@@ -731,7 +773,7 @@ impl AegisApp {
                                 ui.colored_label(Color32::from_rgb(239, 68, 68), err);
                             }
                             ui.add_space(18.0);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if primary_button(ui, s.open_vault_file).clicked() {
                                     self.select_vault_file();
                                 }
@@ -743,7 +785,53 @@ impl AegisApp {
                         }
                     });
             });
+          });
         });
+
+        // Language: small translate icon in the bottom-left corner (no big drop-down).
+        egui::Area::new(egui::Id::new("unlock_lang_area"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_BOTTOM, Vec2::new(14.0, -14.0))
+            .show(ctx, |ui| {
+                let resp = icon_button(ui, Icon::Translate, 36.0, None);
+                let pid = egui::Id::new("unlock_lang_popup");
+                if resp.clicked() {
+                    ui.memory_mut(|m| m.toggle_popup(pid));
+                }
+                let mut chosen: Option<Option<Lang>> = None;
+                egui::popup::popup_above_or_below_widget(
+                    ui,
+                    pid,
+                    &resp,
+                    egui::AboveOrBelow::Above,
+                    egui::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(170.0);
+                        if menu_item(ui, s.lang_system) {
+                            chosen = Some(None);
+                        }
+                        for l in Lang::ALL {
+                            if menu_item(ui, l.native_name()) {
+                                chosen = Some(Some(l));
+                            }
+                        }
+                    },
+                );
+                if let Some(c) = chosen {
+                    match c {
+                        None => {
+                            self.config.language = None;
+                            self.lang = Lang::detect_system();
+                        }
+                        Some(l) => {
+                            self.config.language = Some(l.code().to_string());
+                            self.lang = l;
+                        }
+                    }
+                    self.config.save();
+                    self.sync_tray();
+                }
+            });
     }
 
     fn render_main_view(&mut self, ctx: &egui::Context) {
@@ -762,123 +850,134 @@ impl AegisApp {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unsaved Vault".to_string());
 
-        let top_bg = if ctx.style().visuals.dark_mode {
-            Color32::from_rgb(18, 21, 30)
-        } else {
-            Color32::WHITE
-        };
+        let dark = ctx.style().visuals.dark_mode;
+        let t = tokens(dark);
+        let win_w = ctx.screen_rect().width();
 
         egui::TopBottomPanel::top("top_bar")
             .frame(
                 egui::Frame::NONE
-                    .fill(top_bg)
-                    .inner_margin(egui::Margin::symmetric(20, 14)),
+                    .fill(t.bar)
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 8.0);
                 ui.horizontal(|ui| {
                     if let Some(logo) = &self.app_logo {
                         ui.add(egui::Image::new((logo.id(), Vec2::splat(26.0))));
                     }
                     ui.label(RichText::new("Aegis").size(19.0).strong());
-                    let dirty_mark = if self.dirty { " *" } else { "" };
-                    let badge_bg = if is_encrypted {
-                        Color32::from_rgba_unmultiplied(32, 149, 242, 35)
-                    } else {
-                        Color32::from_rgba_unmultiplied(245, 158, 11, 35)
-                    };
-                    let badge_fg = if is_encrypted {
-                        AEGIS_BLUE
-                    } else {
-                        Color32::from_rgb(245, 158, 11)
-                    };
-                    egui::Frame::NONE
-                        .fill(badge_bg)
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::symmetric(8, 3))
-                        .show(ui, |ui| {
-                            let status = if is_encrypted { s.encrypted } else { s.plaintext };
-                            ui.label(
-                                RichText::new(format!("{file_label}{dirty_mark} • {status}"))
-                                    .size(11.5)
-                                    .color(badge_fg),
-                            );
-                        });
+                    if win_w >= 640.0 {
+                        let dirty_mark = if self.dirty { " •" } else { "" };
+                        let (badge_bg, badge_fg) = if is_encrypted {
+                            (Color32::from_rgba_unmultiplied(32, 149, 242, 32), AEGIS_BLUE)
+                        } else {
+                            (Color32::from_rgba_unmultiplied(245, 158, 11, 32), AEGIS_AMBER)
+                        };
+                        egui::Frame::NONE
+                            .fill(badge_bg)
+                            .corner_radius(10.0)
+                            .inner_margin(egui::Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                let status = if is_encrypted { s.encrypted } else { s.plaintext };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{file_label}{dirty_mark}  ·  {status}"))
+                                            .size(11.5)
+                                            .color(badge_fg),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let theme_lbl = if self.config.dark_mode { "Light" } else { "Dark" };
-                        if secondary_button(ui, theme_lbl).clicked() {
-                            self.config.dark_mode = !self.config.dark_mode;
-                            apply_theme(ctx, self.config.dark_mode);
-                            self.config.save();
-                        }
-                        if secondary_button(ui, self.lang.short_label()).clicked() {
-                            self.lang = self.lang.toggle();
-                            self.config.language = Some(self.lang.code().to_string());
-                            self.config.save();
-                            self.sync_tray();
-                        }
-                        if secondary_button(ui, s.lock).clicked() {
-                            self.lock_vault();
-                            return;
-                        }
-                        if secondary_button(ui, s.settings).clicked() {
-                            self.settings_open = !self.settings_open;
-                        }
-                        ui.menu_button(s.vault_menu, |ui| {
-                            if ui.button(s.save_ctrl_s).clicked() {
-                                self.save_vault();
-                                ui.close_menu();
-                            }
-                            if ui.button(s.save_as).clicked() {
-                                self.save_vault_as();
-                                ui.close_menu();
-                            }
-                            if ui.button(s.open_another_vault).clicked() {
-                                self.select_vault_file();
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(s.encryption_pwd).clicked() {
-                                self.security_modal_open = true;
-                                self.sec_new_password.clear();
-                                self.sec_confirm_password.clear();
-                                ui.close_menu();
-                            }
-                            if ui.button(s.manage_groups).clicked() {
-                                self.groups_modal_open = true;
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button(s.minimize_tray).clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                                ui.close_menu();
-                            }
-                            if ui.button(s.quit).clicked() {
-                                self.quitting = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                ui.close_menu();
-                            }
-                        });
-                        if secondary_button(ui, s.import_uri).clicked() {
-                            self.import_modal = Some(String::new());
-                        }
                         if primary_button(ui, s.add_entry).clicked() {
                             self.entry_editor = Some(EntryEditorState::new_empty());
+                        }
+
+                        let more = icon_button(ui, Icon::More, 30.0, None);
+                        let more_id = egui::Id::new("more_menu");
+                        if more.clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(more_id));
+                        }
+                        egui::popup::popup_below_widget(
+                            ui,
+                            more_id,
+                            &more,
+                            egui::PopupCloseBehavior::CloseOnClick,
+                            |ui| {
+                                ui.set_min_width(210.0);
+                                if menu_item(ui, s.import_uri) {
+                                    self.import_modal = Some(String::new());
+                                }
+                                ui.separator();
+                                if menu_item(ui, s.save_ctrl_s) {
+                                    self.save_vault();
+                                }
+                                if menu_item(ui, s.save_as) {
+                                    self.save_vault_as();
+                                }
+                                if menu_item(ui, s.open_another_vault) {
+                                    self.select_vault_file();
+                                }
+                                ui.separator();
+                                if menu_item(ui, s.encryption_pwd) {
+                                    self.security_modal_open = true;
+                                    self.sec_new_password.clear();
+                                    self.sec_confirm_password.clear();
+                self.sec_old_password.clear();
+                                }
+                                if menu_item(ui, s.manage_groups) {
+                                    self.groups_modal_open = true;
+                                }
+                                ui.separator();
+                                let theme_lbl = if self.config.dark_mode {
+                                    s.theme_light
+                                } else {
+                                    s.theme_dark
+                                };
+                                if menu_item(ui, theme_lbl) {
+                                    self.config.dark_mode = !self.config.dark_mode;
+                                    apply_theme(ctx, self.config.dark_mode);
+                                    self.config.save();
+                                }
+                                ui.separator();
+                                if menu_item(ui, s.quit) {
+                                    self.quitting = true;
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            },
+                        );
+
+                        if icon_button(ui, Icon::Gear, 30.0, None)
+                            .on_hover_text(s.settings)
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
+                        }
+                        if icon_button(ui, Icon::Lock, 30.0, None)
+                            .on_hover_text(s.lock)
+                            .clicked()
+                        {
+                            self.lock_vault();
                         }
                     });
                 });
 
-                ui.add_space(10.0);
+                // Search
                 ui.horizontal(|ui| {
+                    let w = ui.available_width();
                     ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .hint_text(s.search_hint)
-                            .desired_width(280.0),
+                            .margin(egui::Margin::symmetric(12, 8))
+                            .desired_width(w),
                     );
-                    if !self.search_query.is_empty() && secondary_button(ui, s.clear).clicked() {
-                        self.search_query.clear();
-                    }
+                });
 
+                // Sort + filters (wrap instead of overflowing)
+                ui.horizontal_wrapped(|ui| {
                     let sort_lbl = match self.config.sort_mode {
                         SortMode::Default => s.sort_default,
                         SortMode::IssuerAsc => s.sort_issuer_az,
@@ -888,7 +987,7 @@ impl AegisApp {
                         SortMode::FavoritesFirst => s.sort_fav_first,
                     };
                     egui::ComboBox::from_id_salt("sort_combo")
-                        .selected_text(format!("{}: {}", s.sort_label, sort_lbl))
+                        .selected_text(sort_lbl)
                         .show_ui(ui, |ui| {
                             for (mode, lbl) in [
                                 (SortMode::Default, s.sort_default),
@@ -906,40 +1005,30 @@ impl AegisApp {
                                 }
                             }
                         });
-
-                    ui.add_space(6.0);
-                    egui::ScrollArea::horizontal().show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if filter_pill(ui, self.filter_mode == FilterMode::All, s.all).clicked()
-                            {
-                                self.filter_mode = FilterMode::All;
+                    if filter_pill(ui, self.filter_mode == FilterMode::All, s.all).clicked() {
+                        self.filter_mode = FilterMode::All;
+                    }
+                    if filter_pill(ui, self.filter_mode == FilterMode::Favorites, s.favorites)
+                        .clicked()
+                    {
+                        self.filter_mode = FilterMode::Favorites;
+                    }
+                    if let Some(v) = &self.vault {
+                        for g in &v.db.groups {
+                            let sel = self.filter_mode == FilterMode::Group(g.uuid.clone());
+                            if filter_pill(ui, sel, &g.name).clicked() {
+                                self.filter_mode = FilterMode::Group(g.uuid.clone());
                             }
-                            if filter_pill(
-                                ui,
-                                self.filter_mode == FilterMode::Favorites,
-                                s.favorites,
-                            )
-                            .clicked()
-                            {
-                                self.filter_mode = FilterMode::Favorites;
-                            }
-                            if let Some(v) = &self.vault {
-                                for g in &v.db.groups {
-                                    let sel = self.filter_mode == FilterMode::Group(g.uuid.clone());
-                                    if filter_pill(ui, sel, &g.name).clicked() {
-                                        self.filter_mode = FilterMode::Group(g.uuid.clone());
-                                    }
-                                }
-                            }
-                        });
-                    });
+                        }
+                    }
                 });
             });
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::central_panel(&ctx.style())
-                    .inner_margin(egui::Margin::symmetric(20, 16)),
+                egui::Frame::NONE
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(16, 14)),
             )
             .show(ctx, |ui| {
                 let now_secs = current_unix_seconds();
@@ -950,6 +1039,11 @@ impl AegisApp {
                     .vault
                     .as_ref()
                     .map(|v| v.db.entries.clone())
+                    .unwrap_or_default();
+                let groups: Vec<VaultGroup> = self
+                    .vault
+                    .as_ref()
+                    .map(|v| v.db.groups.clone())
                     .unwrap_or_default();
 
                 let mut filtered: Vec<VaultEntry> = entries_snapshot
@@ -978,260 +1072,465 @@ impl AegisApp {
                             .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
                     }),
                     SortMode::IssuerDesc => filtered.sort_by(|a, b| {
-                        b.issuer
-                            .to_ascii_lowercase()
-                            .cmp(&a.issuer.to_ascii_lowercase())
+                        b.issuer.to_ascii_lowercase().cmp(&a.issuer.to_ascii_lowercase())
                     }),
                     SortMode::NameAsc => filtered.sort_by(|a, b| {
-                        a.name
-                            .to_ascii_lowercase()
-                            .cmp(&b.name.to_ascii_lowercase())
+                        a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())
                     }),
                     SortMode::NameDesc => filtered.sort_by(|a, b| {
-                        b.name
-                            .to_ascii_lowercase()
-                            .cmp(&a.name.to_ascii_lowercase())
+                        b.name.to_ascii_lowercase().cmp(&a.name.to_ascii_lowercase())
                     }),
                     SortMode::FavoritesFirst => filtered.sort_by(|a, b| {
                         b.favorite.cmp(&a.favorite).then_with(|| {
-                            a.issuer
-                                .to_ascii_lowercase()
-                                .cmp(&b.issuer.to_ascii_lowercase())
+                            a.issuer.to_ascii_lowercase().cmp(&b.issuer.to_ascii_lowercase())
                         })
                     }),
                 }
 
+                // Drop selections that no longer exist
+                let all_ids: std::collections::HashSet<String> =
+                    filtered.iter().map(|e| e.uuid.clone()).collect();
+                self.selected.retain(|id| all_ids.contains(id));
+
                 if filtered.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(80.0);
-                        ui.label(RichText::new(s.no_entries).size(17.0).weak());
+                        ui.label(RichText::new(s.no_entries).size(17.0).color(t.muted));
                         ui.add_space(6.0);
-                        ui.label(RichText::new(s.no_entries_tip).small().weak());
+                        ui.label(RichText::new(s.no_entries_tip).small().color(t.muted));
                     });
                     return;
                 }
 
-                let mut copy_req: Option<(String, String)> = None;
-                let mut fav_toggle_uuid: Option<String> = None;
-                let mut hotp_inc_uuid: Option<String> = None;
-                let mut edit_entry: Option<VaultEntry> = None;
-                let mut delete_uuid: Option<String> = None;
+                let mut actions: Vec<CardAction> = Vec::new();
+
+                // Selection bar
+                if !self.selected.is_empty() {
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgba_unmultiplied(32, 149, 242, 30))
+                        .corner_radius(12.0)
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} {}",
+                                        self.selected.len(),
+                                        s.selected_n
+                                    ))
+                                    .strong()
+                                    .color(AEGIS_BLUE),
+                                );
+                                if secondary_button(ui, s.ctx_select_all).clicked() {
+                                    actions.push(CardAction::SelectAll);
+                                }
+                                if secondary_button(ui, s.clear).clicked() {
+                                    actions.push(CardAction::ClearSelection);
+                                }
+                                if danger_button(ui, s.delete).clicked() {
+                                    actions.push(CardAction::Delete(
+                                        self.selected.iter().cloned().collect(),
+                                    ));
+                                }
+                            });
+                        });
+                    ui.add_space(10.0);
+                }
+
+                // Ctrl + scroll (or pinch) scales the cards; the grid re-flows automatically.
+                // Only real Ctrl + mouse-wheel events count (egui's generic zoom_delta can
+                // report phantom zooms and made the cards grow on their own).
+                let wheel: f32 = ctx.input(|i| {
+                    i.raw
+                        .events
+                        .iter()
+                        .filter_map(|e| match e {
+                            egui::Event::MouseWheel { unit, delta, modifiers, .. }
+                                if modifiers.ctrl || modifiers.command =>
+                            {
+                                Some(match unit {
+                                    egui::MouseWheelUnit::Line => delta.y * 0.06,
+                                    egui::MouseWheelUnit::Page => delta.y * 0.3,
+                                    egui::MouseWheelUnit::Point => delta.y * 0.002,
+                                })
+                            }
+                            _ => None,
+                        })
+                        .sum()
+                });
+                if wheel.abs() > f32::EPSILON {
+                    self.config.card_scale = (self.config.card_scale * (1.0 + wheel)).clamp(0.7, 1.8);
+                    self.scale_save_pending = true;
+                } else if self.scale_save_pending {
+                    self.scale_save_pending = false;
+                    self.config.save();
+                }
+                if ctx.input(|i| (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::Num0)) {
+                    self.config.card_scale = 1.0;
+                    self.config.save();
+                }
+                let z = self.config.card_scale;
 
                 let avail_w = ui.available_width();
-                let cols = if avail_w >= 1460.0 {
-                    4
-                } else if avail_w >= 1040.0 {
-                    3
-                } else if avail_w >= 660.0 {
-                    2
-                } else {
-                    1
-                };
                 let gap = 12.0_f32;
-                let card_w = ((avail_w - (cols as f32 - 1.0) * gap) / cols as f32).max(260.0);
+                let min_card = 290.0_f32 * z;
+                let cols = (((avail_w + gap) / (min_card + gap)).floor() as usize).max(1);
+                let card_w = (avail_w - gap * (cols as f32 - 1.0)) / cols as f32;
+                let card_h = 104.0_f32 * z;
+                let rows = filtered.len().div_ceil(cols);
 
-                let dark_mode = ui.visuals().dark_mode;
-                let card_fill = if dark_mode {
-                    Color32::from_rgb(22, 26, 38)
-                } else {
-                    Color32::WHITE
-                };
-                let card_stroke = if dark_mode {
-                    egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 44, 62))
-                } else {
-                    egui::Stroke::new(1.0_f32, Color32::from_rgb(222, 228, 238))
-                };
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let total_h = rows as f32 * (card_h + gap) - gap;
+                        let (area, _) = ui.allocate_exact_size(
+                            Vec2::new(avail_w, total_h.max(0.0)),
+                            Sense::hover(),
+                        );
+                        let ctrl_held = ui.input(|i| i.modifiers.command || i.modifiers.shift);
+                        let selecting = !self.selected.is_empty();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for chunk in filtered.chunks(cols) {
-                        ui.horizontal(|ui| {
-                            for (idx, entry) in chunk.iter().enumerate() {
-                                if idx > 0 {
-                                    ui.add_space(gap - 8.0);
-                                }
-                                let texture = self.get_or_load_icon(ctx, entry);
-                                let code_res = generate_code_for_entry(entry, now_secs);
-                                let display_code = match &code_res {
-                                    Ok(c) => format_code_display(c),
-                                    Err(_) => "ERROR".to_string(),
-                                };
-
-                                egui::Frame::NONE
-                                    .fill(card_fill)
-                                    .stroke(card_stroke)
-                                    .corner_radius(12.0)
-                                    .inner_margin(egui::Margin::same(16))
-                                    .show(ui, |ui| {
-                                        ui.set_width(card_w - 34.0);
-
-                                        // Card Top Row: Avatar + Title + Actions
-                                        ui.horizontal(|ui| {
-                                            if self.config.show_icons {
-                                                draw_issuer_avatar(
-                                                    ui,
-                                                    &entry.issuer,
-                                                    &entry.name,
-                                                    texture.as_ref(),
-                                                    38.0,
-                                                );
-                                                ui.add_space(6.0);
-                                            }
-                                            ui.vertical(|ui| {
-                                                let title = if entry.issuer.is_empty() {
-                                                    entry.name.as_str()
-                                                } else {
-                                                    entry.issuer.as_str()
-                                                };
-                                                ui.label(
-                                                    RichText::new(title).size(15.0).strong(),
-                                                );
-                                                if !entry.issuer.is_empty()
-                                                    && !entry.name.is_empty()
-                                                {
-                                                    ui.label(
-                                                        RichText::new(&entry.name)
-                                                            .size(12.0)
-                                                            .weak(),
-                                                    );
-                                                } else {
-                                                    ui.label(
-                                                        RichText::new(entry.entry_type.label())
-                                                            .size(11.0)
-                                                            .weak(),
-                                                    );
-                                                }
-                                            });
-
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::TOP),
-                                                |ui| {
-                                                    if ui
-                                                        .small_button("Del")
-                                                        .on_hover_text("Delete")
-                                                        .clicked()
-                                                    {
-                                                        delete_uuid = Some(entry.uuid.clone());
-                                                    }
-                                                    if ui
-                                                        .small_button("Edit")
-                                                        .on_hover_text("Edit")
-                                                        .clicked()
-                                                    {
-                                                        edit_entry = Some(entry.clone());
-                                                    }
-                                                    let fav_txt = if entry.favorite {
-                                                        RichText::new("★").color(
-                                                            Color32::from_rgb(245, 158, 11),
-                                                        )
-                                                    } else {
-                                                        RichText::new("☆").weak()
-                                                    };
-                                                    if ui
-                                                        .add(egui::Button::new(fav_txt).frame(false))
-                                                        .on_hover_text("Toggle favorite")
-                                                        .clicked()
-                                                    {
-                                                        fav_toggle_uuid = Some(entry.uuid.clone());
-                                                    }
-                                                },
-                                            );
-                                        });
-
-                                        if !entry.note.is_empty() {
-                                            ui.add_space(4.0);
-                                            ui.label(
-                                                RichText::new(&entry.note)
-                                                    .size(11.5)
-                                                    .italics()
-                                                    .weak(),
-                                            );
-                                        }
-
-                                        ui.add_space(10.0);
-
-                                        // Card Bottom Row: Big Code + Ring
-                                        ui.horizontal(|ui| {
-                                            let code_btn = ui.add(
-                                                egui::Button::new(
-                                                    RichText::new(&display_code)
-                                                        .size(25.0)
-                                                        .monospace()
-                                                        .strong()
-                                                        .color(AEGIS_BLUE),
-                                                )
-                                                .frame(false),
-                                            );
-                                            if code_btn
-                                                .on_hover_text("Click to copy code")
-                                                .clicked()
-                                            {
-                                                if let Ok(raw_code) = code_res {
-                                                    let lbl = if entry.issuer.is_empty() {
-                                                        entry.name.clone()
-                                                    } else {
-                                                        entry.issuer.clone()
-                                                    };
-                                                    copy_req = Some((raw_code, lbl));
-                                                }
-                                            }
-
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if entry.entry_type == OtpType::Hotp {
-                                                        if secondary_button(ui, "Next").clicked() {
-                                                            hotp_inc_uuid =
-                                                                Some(entry.uuid.clone());
-                                                        }
-                                                    } else {
-                                                        let period =
-                                                            entry.info.period.unwrap_or(30) as f64;
-                                                        let elapsed_in_period =
-                                                            ((now_millis as f64) / 1000.0) % period;
-                                                        let remaining =
-                                                            (period - elapsed_in_period) as f32;
-                                                        draw_countdown_ring(
-                                                            ui,
-                                                            remaining,
-                                                            period as f32,
-                                                            32.0,
-                                                        );
-                                                    }
-                                                },
-                                            );
-                                        });
-                                    });
+                        for (i, entry) in filtered.iter().enumerate() {
+                            let (row, col) = (i / cols, i % cols);
+                            let rect = Rect::from_min_size(
+                                area.min
+                                    + Vec2::new(
+                                        col as f32 * (card_w + gap),
+                                        row as f32 * (card_h + gap),
+                                    ),
+                                Vec2::new(card_w, card_h),
+                            );
+                            if !ui.is_rect_visible(rect) {
+                                continue;
                             }
-                        });
-                        ui.add_space(gap - 4.0);
-                    }
-                });
+                            let texture = self.get_or_load_icon(ctx, entry);
+                            let code_res = generate_code_for_entry(entry, now_secs);
+                            let display_code = match &code_res {
+                                Ok(c) => format_code_display(c),
+                                Err(_) => "ERROR".to_string(),
+                            };
+                            let is_selected = self.selected.contains(&entry.uuid);
+                            let id = egui::Id::new(("card", &entry.uuid));
+                            let resp = ui
+                                .interact(rect, id, Sense::click())
+                                .on_hover_cursor(egui::CursorIcon::PointingHand);
+                            let hovered = ui.rect_contains_pointer(rect) || resp.context_menu_opened();
 
-                if let Some((code, lbl)) = copy_req {
-                    self.copy_to_clipboard(&code, &lbl);
-                }
-                if let Some(uuid) = fav_toggle_uuid {
-                    if let Some(v) = &mut self.vault {
-                        if let Some(e) = v.db.entries.iter_mut().find(|x| x.uuid == uuid) {
-                            e.favorite = !e.favorite;
-                            self.dirty = true;
+                            // Card surface
+                            let fill = if hovered { t.card_hover } else { t.card };
+                            let stroke = if is_selected {
+                                egui::Stroke::new(2.0_f32, AEGIS_BLUE)
+                            } else {
+                                egui::Stroke::new(1.0_f32, t.border)
+                            };
+                            ui.painter().rect(
+                                rect,
+                                16.0,
+                                fill,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+
+                            let pad = 14.0 * z;
+                            let inner = rect.shrink(pad);
+
+                            // Avatar
+                            let av = 36.0 * z;
+                            let av_rect = Rect::from_min_size(inner.min, Vec2::splat(av));
+                            if self.config.show_icons {
+                                let mut child = ui.new_child(
+                                    egui::UiBuilder::new().max_rect(av_rect),
+                                );
+                                draw_issuer_avatar(
+                                    &mut child,
+                                    &entry.issuer,
+                                    &entry.name,
+                                    texture.as_ref(),
+                                    av,
+                                );
+                            }
+                            let text_x = if self.config.show_icons {
+                                inner.min.x + av + 10.0
+                            } else {
+                                inner.min.x
+                            };
+
+                            // Title + subtitle (truncated, never overflow)
+                            let right_reserved = 30.0 + if hovered { 84.0 } else { 0.0 };
+                            let text_w = (inner.max.x - right_reserved - text_x).max(20.0);
+                            let title = if entry.issuer.is_empty() {
+                                entry.name.as_str()
+                            } else {
+                                entry.issuer.as_str()
+                            };
+                            let sub: String = if !entry.issuer.is_empty() && !entry.name.is_empty() {
+                                entry.name.clone()
+                            } else {
+                                entry.entry_type.label().to_string()
+                            };
+                            let g1 = fit_text(ui, title, egui::FontId::proportional(15.0 * z), t.text, text_w);
+                            let g2 = fit_text(ui, &sub, egui::FontId::proportional(12.0 * z), t.muted, text_w);
+                            ui.painter().galley(Pos2::new(text_x, inner.min.y + 1.0), g1, t.text);
+                            ui.painter().galley(Pos2::new(text_x, inner.min.y + 21.0 * z), g2, t.muted);
+
+                            // Code (bottom-left)
+                            let code_color = if entry.favorite { AEGIS_BLUE } else { AEGIS_BLUE };
+                            ui.painter().text(
+                                Pos2::new(inner.min.x, inner.max.y),
+                                egui::Align2::LEFT_BOTTOM,
+                                &display_code,
+                                egui::FontId::monospace(27.0 * z),
+                                code_color,
+                            );
+
+                            // Ring / next (bottom-right)
+                            let ring_size = 32.0 * z;
+                            let ring_rect = Rect::from_min_size(
+                                Pos2::new(inner.max.x - ring_size, inner.max.y - ring_size),
+                                Vec2::splat(ring_size),
+                            );
+                            if entry.entry_type == OtpType::Hotp {
+                                let r = Rect::from_min_size(
+                                    Pos2::new(inner.max.x - 56.0 * z, inner.max.y - 28.0 * z),
+                                    Vec2::new(56.0 * z, 28.0 * z),
+                                );
+                                let rr = ui.interact(r, id.with("next"), Sense::click());
+                                ui.painter().rect_filled(
+                                    r,
+                                    14.0,
+                                    if rr.hovered() { t.chip_hover } else { t.chip },
+                                );
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "Next",
+                                    egui::FontId::proportional(12.5),
+                                    t.text,
+                                );
+                                if rr.clicked() {
+                                    actions.push(CardAction::HotpNext(entry.uuid.clone()));
+                                }
+                            } else {
+                                let period = entry.info.period.unwrap_or(30) as f64;
+                                let elapsed = ((now_millis as f64) / 1000.0) % period;
+                                let remaining = (period - elapsed) as f32;
+                                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(ring_rect));
+                                draw_countdown_ring(&mut child, remaining, period as f32, ring_size);
+                            }
+
+                            // Star (always) + edit/delete (on hover)
+                            let star_rect = Rect::from_min_size(
+                                Pos2::new(inner.max.x - 26.0, inner.min.y - 3.0),
+                                Vec2::splat(26.0),
+                            );
+                            let star_resp = ui.interact(star_rect, id.with("star"), Sense::click());
+                            if entry.favorite {
+                                paint_icon(ui.painter(), Icon::Star { filled: true }, star_rect.center(), 9.0, AEGIS_AMBER);
+                            } else if hovered || star_resp.hovered() {
+                                paint_icon(
+                                    ui.painter(),
+                                    Icon::Star { filled: false },
+                                    star_rect.center(),
+                                    9.0,
+                                    if star_resp.hovered() { AEGIS_AMBER } else { t.muted },
+                                );
+                            }
+                            if star_resp.clicked() {
+                                actions.push(CardAction::ToggleFav(vec![entry.uuid.clone()]));
+                            }
+
+                            let mut sub_clicked = false;
+                            if hovered {
+                                for (k, icon) in [Icon::Copy, Icon::Pencil, Icon::Trash].into_iter().enumerate() {
+                                    let r = Rect::from_min_size(
+                                        Pos2::new(
+                                            inner.max.x - 26.0 - 28.0 * (3 - k) as f32,
+                                            inner.min.y - 3.0,
+                                        ),
+                                        Vec2::splat(26.0),
+                                    );
+                                    let rr = ui.interact(r, id.with(("act", k)), Sense::click());
+                                    if rr.hovered() {
+                                        ui.painter().circle_filled(r.center(), 13.0, t.chip_hover);
+                                    }
+                                    paint_icon(
+                                        ui.painter(),
+                                        icon,
+                                        r.center(),
+                                        8.0,
+                                        if rr.hovered() { t.text } else { t.muted },
+                                    );
+                                    if rr.clicked() {
+                                        sub_clicked = true;
+                                        if k == 0 {
+                                            if let Ok(raw) = &code_res {
+                                                let lbl = if entry.issuer.is_empty() {
+                                                    entry.name.clone()
+                                                } else {
+                                                    entry.issuer.clone()
+                                                };
+                                                actions.push(CardAction::Copy(raw.clone(), lbl));
+                                            }
+                                        } else if k == 1 {
+                                            actions.push(CardAction::Edit(entry.clone()));
+                                        } else {
+                                            actions.push(CardAction::Delete(vec![entry.uuid.clone()]));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Card click: copy (or toggle selection)
+                            if resp.clicked() && !sub_clicked && !star_resp.hovered() {
+                                if ctrl_held || selecting {
+                                    actions.push(CardAction::ToggleSelect(entry.uuid.clone()));
+                                } else if let Ok(raw) = &code_res {
+                                    let lbl = if entry.issuer.is_empty() {
+                                        entry.name.clone()
+                                    } else {
+                                        entry.issuer.clone()
+                                    };
+                                    actions.push(CardAction::Copy(raw.clone(), lbl));
+                                }
+                            }
+
+                            // Right-click context menu
+                            let targets: Vec<String> = if is_selected {
+                                self.selected.iter().cloned().collect()
+                            } else {
+                                vec![entry.uuid.clone()]
+                            };
+                            let multi = targets.len() > 1;
+                            resp.context_menu(|ui| {
+                                ui.set_min_width(200.0);
+                                if let Ok(raw) = &code_res {
+                                    if menu_item(ui, s.ctx_copy) {
+                                        let lbl = if entry.issuer.is_empty() {
+                                            entry.name.clone()
+                                        } else {
+                                            entry.issuer.clone()
+                                        };
+                                        actions.push(CardAction::Copy(raw.clone(), lbl));
+                                    }
+                                }
+                                let fav_lbl = if entry.favorite {
+                                    s.ctx_fav_remove
+                                } else {
+                                    s.ctx_fav_add
+                                };
+                                if menu_item(ui, fav_lbl) {
+                                    let make_fav = !entry.favorite;
+                                    let ids = targets.clone();
+                                    actions.push(CardAction::SetFav(ids, make_fav));
+                                }
+                                if !multi && menu_item(ui, s.ctx_edit) {
+                                    actions.push(CardAction::Edit(entry.clone()));
+                                }
+                                if !groups.is_empty() {
+                                    ui.menu_button(s.ctx_group, |ui| {
+                                        for g in &groups {
+                                            let in_all = self.vault.as_ref().is_some_and(|v| {
+                                                targets.iter().all(|id| {
+                                                    v.db.entries
+                                                        .iter()
+                                                        .find(|e| &e.uuid == id)
+                                                        .is_some_and(|e| e.groups.contains(&g.uuid))
+                                                })
+                                            });
+                                            let mut checked = in_all;
+                                            if ui.checkbox(&mut checked, &g.name).changed() {
+                                                actions.push(CardAction::SetGroup(
+                                                    targets.clone(),
+                                                    g.uuid.clone(),
+                                                    checked,
+                                                ));
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                }
+                                ui.separator();
+                                if menu_item(ui, s.ctx_select_all) {
+                                    actions.push(CardAction::SelectAll);
+                                }
+                                if menu_item(ui, if is_selected { s.ctx_deselect } else { s.ctx_select }) {
+                                    actions.push(CardAction::ToggleSelect(entry.uuid.clone()));
+                                }
+                                ui.separator();
+                                let del_lbl = if multi {
+                                    format!("{} ({})", s.delete, targets.len())
+                                } else {
+                                    s.delete.to_string()
+                                };
+                                if menu_item_colored(ui, &del_lbl, AEGIS_RED) {
+                                    actions.push(CardAction::Delete(targets.clone()));
+                                }
+                            });
                         }
-                    }
+                    });
+
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !self.selected.is_empty() {
+                    self.selected.clear();
                 }
-                if let Some(uuid) = hotp_inc_uuid {
-                    if let Some(v) = &mut self.vault {
-                        if let Some(e) = v.db.entries.iter_mut().find(|x| x.uuid == uuid) {
-                            let next = e.info.counter.unwrap_or(0).saturating_add(1);
-                            e.info.counter = Some(next);
-                            self.dirty = true;
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A))
+                    && self.entry_editor.is_none()
+                    && !ctx.wants_keyboard_input()
+                {
+                    actions.push(CardAction::SelectAll);
+                }
+
+                for a in actions {
+                    match a {
+                        CardAction::Copy(code, lbl) => self.copy_to_clipboard(&code, &lbl),
+                        CardAction::ToggleFav(ids) => {
+                            if let Some(v) = &mut self.vault {
+                                for e in v.db.entries.iter_mut().filter(|e| ids.contains(&e.uuid)) {
+                                    e.favorite = !e.favorite;
+                                }
+                                self.dirty = true;
+                            }
                         }
+                        CardAction::SetFav(ids, val) => {
+                            if let Some(v) = &mut self.vault {
+                                for e in v.db.entries.iter_mut().filter(|e| ids.contains(&e.uuid)) {
+                                    e.favorite = val;
+                                }
+                                self.dirty = true;
+                            }
+                        }
+                        CardAction::SetGroup(ids, gid, add) => {
+                            if let Some(v) = &mut self.vault {
+                                for e in v.db.entries.iter_mut().filter(|e| ids.contains(&e.uuid)) {
+                                    e.groups.retain(|x| x != &gid);
+                                    if add {
+                                        e.groups.push(gid.clone());
+                                    }
+                                }
+                                self.dirty = true;
+                            }
+                        }
+                        CardAction::HotpNext(uuid) => {
+                            if let Some(v) = &mut self.vault {
+                                if let Some(e) = v.db.entries.iter_mut().find(|x| x.uuid == uuid) {
+                                    e.info.counter = Some(e.info.counter.unwrap_or(0).saturating_add(1));
+                                    self.dirty = true;
+                                }
+                            }
+                        }
+                        CardAction::Edit(e) => {
+                            self.entry_editor = Some(EntryEditorState::from_entry(&e));
+                        }
+                        CardAction::Delete(ids) => self.delete_confirm_ids = ids,
+                        CardAction::ToggleSelect(id) => {
+                            if !self.selected.remove(&id) {
+                                self.selected.insert(id);
+                            }
+                        }
+                        CardAction::SelectAll => {
+                            self.selected = filtered.iter().map(|e| e.uuid.clone()).collect();
+                        }
+                        CardAction::ClearSelection => self.selected.clear(),
                     }
-                }
-                if let Some(e) = edit_entry {
-                    self.entry_editor = Some(EntryEditorState::from_entry(&e));
-                }
-                if let Some(uuid) = delete_uuid {
-                    self.delete_confirm_uuid = Some(uuid);
                 }
             });
 
@@ -1254,22 +1553,12 @@ impl AegisApp {
                 .map(|v| v.db.groups.clone())
                 .unwrap_or_default();
 
-            egui::Window::new(title)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_min_width(400.0);
+            let editor_open = modal(ctx, "entry_editor", title, 440.0, |ui| {
 
                     if editor.editing_uuid.is_none() {
-                        ui.horizontal(|ui| {
-                            if primary_button(ui, s.scan_qr).clicked() {
-                                editor.qr_menu_open = !editor.qr_menu_open;
-                            }
-                            if secondary_button(ui, s.enter_manually).clicked() {
-                                editor.qr_menu_open = false;
-                            }
-                        });
+                        if secondary_button(ui, s.scan_qr).clicked() {
+                            editor.qr_menu_open = !editor.qr_menu_open;
+                        }
 
                         if editor.qr_menu_open {
                             ui.add_space(6.0);
@@ -1334,52 +1623,43 @@ impl AegisApp {
                         ui.add_space(10.0);
                     }
 
-                    egui::Grid::new("entry_editor_grid")
-                        .num_columns(2)
-                        .spacing([12.0, 8.0])
-                        .show(ui, |ui| {
-                            ui.label(s.issuer);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.issuer)
-                                    .hint_text("e.g. Google, GitHub")
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(s.account_name);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.name)
-                                    .hint_text("e.g. user@example.com")
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(s.secret_base32);
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut editor.secret)
-                                        .password(!editor.show_secret)
-                                        .desired_width(190.0),
-                                );
-                                let lbl = if editor.show_secret { "Hide" } else { "Show" };
-                                if ui.small_button(lbl).clicked() {
-                                    editor.show_secret = !editor.show_secret;
-                                }
-                            });
-                            ui.end_row();
-
-                            ui.label(s.note);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.note)
-                                    .hint_text(s.optional)
-                                    .desired_width(240.0),
-                            );
-                            ui.end_row();
-
-                            ui.label(s.favorite);
-                            ui.checkbox(&mut editor.favorite, "");
-                            ui.end_row();
-                        });
+                    let full = ui.available_width();
+                    field_label(ui, s.issuer);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.issuer)
+                            .hint_text("e.g. Google, GitHub")
+                            .margin(egui::Margin::symmetric(10, 7))
+                            .desired_width(full),
+                    );
+                    field_label(ui, s.account_name);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.name)
+                            .hint_text("e.g. user@example.com")
+                            .margin(egui::Margin::symmetric(10, 7))
+                            .desired_width(full),
+                    );
+                    field_label(ui, s.secret_base32);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut editor.secret)
+                                .password(!editor.show_secret)
+                                .margin(egui::Margin::symmetric(10, 7))
+                                .desired_width((full - 80.0).max(60.0)),
+                        );
+                        let lbl = if editor.show_secret { "Hide" } else { "Show" };
+                        if secondary_button(ui, lbl).clicked() {
+                            editor.show_secret = !editor.show_secret;
+                        }
+                    });
+                    field_label(ui, s.note);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut editor.note)
+                            .hint_text(s.optional)
+                            .margin(egui::Margin::symmetric(10, 7))
+                            .desired_width(full),
+                    );
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut editor.favorite, s.favorite.trim_end_matches(':'));
 
                     if !groups.is_empty() {
                         ui.add_space(6.0);
@@ -1410,7 +1690,7 @@ impl AegisApp {
                     ui.collapsing(adv_title, |ui| {
                         egui::Grid::new("entry_advanced_grid")
                             .num_columns(2)
-                            .spacing([12.0, 8.0])
+                            .spacing([12.0, 8.0]).min_col_width(80.0)
                             .show(ui, |ui| {
                                 ui.label(s.otp_type);
                                 egui::ComboBox::from_id_salt("otp_type_combo")
@@ -1485,10 +1765,7 @@ impl AegisApp {
                     }
 
                     ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if secondary_button(ui, s.cancel).clicked() {
-                            keep_open = false;
-                        }
+                    ui.horizontal_wrapped(|ui| {
                         if primary_button(ui, s.save_entry).clicked() {
                             let existing = editor.editing_uuid.as_ref().and_then(|id| {
                                 self.vault
@@ -1517,10 +1794,13 @@ impl AegisApp {
                                 }
                             }
                         }
+                        if secondary_button(ui, s.cancel).clicked() {
+                            keep_open = false;
+                        }
                     });
                 });
 
-            if keep_open {
+            if keep_open && editor_open {
                 self.entry_editor = Some(editor);
             }
         }
@@ -1528,12 +1808,7 @@ impl AegisApp {
         // 2. Import otpauth:// URI Modal
         if let Some(mut uri_text) = self.import_modal.take() {
             let mut keep_open = true;
-            egui::Window::new("Import otpauth:// URIs")
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_min_width(420.0);
+            let still = modal(ctx, "import_modal", "Import otpauth:// URIs", 460.0, |ui| {
                     ui.label("Paste one or more otpauth:// URIs (one per line):");
                     ui.add_space(6.0);
                     ui.add(
@@ -1573,21 +1848,14 @@ impl AegisApp {
                         }
                     });
                 });
-            if keep_open {
+            if keep_open && still {
                 self.import_modal = Some(uri_text);
             }
         }
 
         // 3. Manage Groups Modal
         if self.groups_modal_open {
-            let mut open = true;
-            egui::Window::new("Manage Groups")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_min_width(320.0);
+            let open = modal(ctx, "m_ManageGroups", "Manage Groups", 360.0, |ui| {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.new_group_name)
@@ -1641,14 +1909,17 @@ impl AegisApp {
 
         // 4. Vault Encryption / Password Modal
         if self.security_modal_open {
-            let mut open = true;
-            egui::Window::new(s.vault_encryption)
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_min_width(340.0);
+            let open = modal(ctx, "m_svault_encryption", s.vault_encryption, 380.0, |ui| {
+                    let needs_old = self.vault.as_ref().is_some_and(|v| v.is_encrypted());
+                    if needs_old {
+                        ui.label(s.current_pwd);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sec_old_password)
+                                .password(true)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(8.0);
+                    }
                     ui.label(s.new_pwd_hint);
                     ui.add_space(8.0);
                     ui.label(s.new_pwd);
@@ -1666,9 +1937,21 @@ impl AegisApp {
                     );
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if ui.button(s.apply).clicked() {
-                            if self.sec_new_password != self.sec_confirm_password {
-                                self.show_toast("Passwords do not match", true);
+                        if primary_button(ui, s.apply).clicked() {
+                            // Verify the current password against the in-memory vault.
+                            let old_ok = !needs_old
+                                || self
+                                    .vault
+                                    .as_ref()
+                                    .and_then(|v| v.to_vault_file().ok())
+                                    .and_then(|f| serde_json::to_string(&f).ok())
+                                    .is_some_and(|js| {
+                                        parse_vault_str(&js, Some(&self.sec_old_password)).is_ok()
+                                    });
+                            if !old_ok {
+                                self.show_toast(s.wrong_pwd, true);
+                            } else if self.sec_new_password != self.sec_confirm_password {
+                                self.show_toast(s.passwords_mismatch, true);
                             } else if let Some(v) = &mut self.vault {
                                 let pwd_opt = if self.sec_new_password.is_empty() {
                                     None
@@ -1681,6 +1964,7 @@ impl AegisApp {
                                         self.security_modal_open = false;
                                         self.sec_new_password.clear();
                                         self.sec_confirm_password.clear();
+                self.sec_old_password.clear();
                                         self.show_toast(
                                             "Encryption updated (remember to Save)",
                                             false,
@@ -1698,39 +1982,65 @@ impl AegisApp {
         }
 
         // 5. Delete Confirmation Modal
-        if let Some(uuid) = self.delete_confirm_uuid.clone() {
-            egui::Window::new(s.delete_entry)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.label(s.delete_confirm);
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(s.cancel).clicked() {
-                            self.delete_confirm_uuid = None;
-                        }
-                        if ui
-                            .button(
-                                RichText::new(s.delete)
-                                    .color(Color32::from_rgb(239, 68, 68))
-                                    .strong(),
-                            )
-                            .clicked()
-                        {
-                            if let Some(v) = &mut self.vault {
-                                v.db.entries.retain(|e| e.uuid != uuid);
-                                self.dirty = true;
-                            }
-                            self.delete_confirm_uuid = None;
-                        }
-                    });
+        if !self.delete_confirm_ids.is_empty() {
+            let ids = self.delete_confirm_ids.clone();
+            let msg = if ids.len() > 1 {
+                s.delete_many.replace("{n}", &ids.len().to_string())
+            } else {
+                s.delete_confirm.to_string()
+            };
+            let mut do_delete = false;
+            let mut cancel = false;
+            let open = modal(ctx, "delete_modal", s.delete_entry, 380.0, |ui| {
+                ui.label(msg);
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if danger_button(ui, s.delete).clicked() {
+                        do_delete = true;
+                    }
+                    if secondary_button(ui, s.cancel).clicked() {
+                        cancel = true;
+                    }
                 });
+            });
+            if do_delete {
+                if let Some(v) = &mut self.vault {
+                    v.db.entries.retain(|e| !ids.contains(&e.uuid));
+                    self.dirty = true;
+                }
+                self.selected.clear();
+                self.delete_confirm_ids.clear();
+            } else if cancel || !open {
+                self.delete_confirm_ids.clear();
+            }
+        }
+
+        // Unencrypted export confirmation
+        if self.export_confirm_open {
+            let mut go = false;
+            let mut cancel = false;
+            let open = modal(ctx, "export_confirm", s.export_plain_title, 400.0, |ui| {
+                ui.label(RichText::new(s.export_warn).color(AEGIS_RED));
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if danger_button(ui, s.export_anyway).clicked() {
+                        go = true;
+                    }
+                    if secondary_button(ui, s.cancel).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if go {
+                self.export_confirm_open = false;
+                self.export_go = true;
+            } else if cancel || !open {
+                self.export_confirm_open = false;
+            }
         }
 
         // 6. Settings Modal (Appearance, Security, Backups, Import / Export)
         if self.settings_open {
-            let mut open = true;
             let mut close_for_groups = false;
             let mut close_for_security = false;
             let mut do_backup_now = false;
@@ -1738,14 +2048,8 @@ impl AegisApp {
             let mut do_import_txt = false;
             let mut do_export = false;
 
-            egui::Window::new(s.settings)
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .show(ctx, |ui| {
-                    ui.set_min_width(470.0);
-                    ui.horizontal(|ui| {
+            let open = modal(ctx, "m_ssettings", s.settings, 510.0, |ui| {
+                    ui.horizontal_wrapped(|ui| {
                         for (tab, lbl) in [
                             (SettingsTab::Appearance, s.tab_appearance),
                             (SettingsTab::Security, s.tab_security),
@@ -1767,48 +2071,31 @@ impl AegisApp {
                                 .spacing([16.0, 10.0])
                                 .show(ui, |ui| {
                                     ui.label(s.theme_label);
-                                    ui.horizontal(|ui| {
-                                        if filter_pill(ui, self.config.dark_mode, "Dark").clicked()
-                                        {
-                                            self.config.dark_mode = true;
-                                            apply_theme(ctx, true);
-                                            self.config.save();
-                                        }
-                                        if filter_pill(ui, !self.config.dark_mode, "Light")
-                                            .clicked()
-                                        {
-                                            self.config.dark_mode = false;
-                                            apply_theme(ctx, false);
-                                            self.config.save();
-                                        }
-                                    });
+                                    let cur = if self.config.dark_mode { 0 } else { 1 };
+                                    if let Some(i) = segmented(ui, cur, &["Dark", "Light"]) {
+                                        self.config.dark_mode = i == 0;
+                                        apply_theme(ctx, self.config.dark_mode);
+                                        self.config.save();
+                                    }
                                     ui.end_row();
 
                                     ui.label(s.language_label);
-                                    ui.horizontal(|ui| {
-                                        if filter_pill(ui, self.lang == Lang::En, "English")
-                                            .clicked()
-                                        {
-                                            self.lang = Lang::En;
-                                            self.config.language = Some("en".into());
-                                            self.config.save();
-                                            self.sync_tray();
-                                        }
-                                        if filter_pill(ui, self.lang == Lang::Tr, "Türkçe")
-                                            .clicked()
-                                        {
-                                            self.lang = Lang::Tr;
-                                            self.config.language = Some("tr".into());
-                                            self.config.save();
-                                            self.sync_tray();
-                                        }
-                                    });
+                                    if language_picker(ui, "settings_lang", &mut self.config, &mut self.lang, s.lang_system) {
+                                        self.sync_tray();
+                                    }
                                     ui.end_row();
                                 });
 
                             ui.add_space(8.0);
                             if ui
                                 .checkbox(&mut self.config.show_icons, s.show_icons_label)
+                                .changed()
+                            {
+                                self.config.save();
+                            }
+                            ui.add_space(4.0);
+                            if ui
+                                .checkbox(&mut self.config.close_to_tray, s.close_to_tray)
                                 .changed()
                             {
                                 self.config.save();
@@ -1941,9 +2228,50 @@ impl AegisApp {
                                         );
                                     });
                             });
+                            let is_json = self.export_format == ExportFormat::AegisJson;
+                            if is_json {
+                                ui.add_space(8.0);
+                                ui.checkbox(&mut self.export_encrypt, s.export_encrypt);
+                                if self.export_encrypt {
+                                    field_label(ui, s.export_pwd);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.export_pwd)
+                                            .password(true)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(s.confirm_password);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.export_pwd_confirm)
+                                            .password(true)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                }
+                            }
+                            let plain_export = !is_json || !self.export_encrypt;
+                            if plain_export {
+                                ui.add_space(8.0);
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgba_unmultiplied(239, 68, 68, 30))
+                                    .corner_radius(10.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 8))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(s.export_warn).color(AEGIS_RED));
+                                    });
+                            }
                             ui.add_space(10.0);
                             if primary_button(ui, s.export_btn).clicked() {
-                                do_export = true;
+                                if is_json
+                                    && self.export_encrypt
+                                    && (self.export_pwd.is_empty()
+                                        || self.export_pwd != self.export_pwd_confirm)
+                                {
+                                    self.show_toast(s.export_pwd_needed, true);
+                                } else if plain_export {
+                                    self.export_confirm_open = true;
+                                } else {
+                                    do_export = true;
+                                }
                             }
                         }
                     }
@@ -1961,6 +2289,7 @@ impl AegisApp {
                 self.security_modal_open = true;
                 self.sec_new_password.clear();
                 self.sec_confirm_password.clear();
+                self.sec_old_password.clear();
             }
             if do_backup_now {
                 match self.run_backup_now() {
@@ -2015,6 +2344,10 @@ impl AegisApp {
                     }
                 }
             }
+            if self.export_go {
+                self.export_go = false;
+                do_export = true;
+            }
             if do_export {
                 if let Some(v) = &self.vault {
                     let entries = v.db.entries.clone();
@@ -2025,7 +2358,16 @@ impl AegisApp {
                                 .set_file_name("aegis-export.json")
                                 .save_file()
                             {
-                                match v.save_to_path(&path) {
+                                let mut ev = v.clone();
+                                let pw = if self.export_encrypt {
+                                    Some(self.export_pwd.clone())
+                                } else {
+                                    None
+                                };
+                                let res = ev
+                                    .set_password(pw.as_deref())
+                                    .and_then(|_| ev.save_to_path(&path));
+                                match res {
                                     Ok(()) => self.show_toast("Exported Aegis JSON", false),
                                     Err(e) => self.show_toast(e.to_string(), true),
                                 }
@@ -2099,9 +2441,22 @@ impl eframe::App for AegisApp {
         }
 
         // Minimize to tray instead of quitting when clicking X
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // Alt+F4 / Super+Q / the X button really close the window. With "keep in tray" on,
+        // a tray-only background process is started first (works on Wayland, unlike hiding).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.dirty && self.vault.is_some() {
+                if self.vault_path.is_some() {
+                    self.save_vault();
+                }
+                if self.dirty {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.quitting = false;
+                    self.show_toast("Unsaved changes: save the vault first (Ctrl+S)", true);
+                }
+            }
+            if !self.dirty && !self.quitting && self.config.close_to_tray {
+                crate::tray::start_background_tray();
+            }
         }
 
         // Track activity for auto-lock
@@ -2134,6 +2489,17 @@ impl eframe::App for AegisApp {
             }
         }
 
+        // The unlock screen scales with the window (small windows shrink it, big ones grow it).
+        let target_zoom = if self.vault.is_none() {
+            let base = ctx.screen_rect().size() * ctx.zoom_factor();
+            (base.x / 520.0).min(base.y / 560.0).clamp(0.8, 1.8)
+        } else {
+            1.0
+        };
+        if (ctx.zoom_factor() - target_zoom).abs() > 0.03 {
+            ctx.set_zoom_factor(target_zoom);
+        }
+
         if self.vault.is_none() {
             self.render_unlock_screen(ctx);
         } else {
@@ -2150,29 +2516,115 @@ impl eframe::App for AegisApp {
     }
 }
 
-fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
-    let mut style = (*ctx.style()).clone();
-    style.spacing.button_padding = Vec2::new(10.0, 6.0);
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
-    style.visuals = if dark_mode {
-        let mut v = egui::Visuals::dark();
-        v.panel_fill = Color32::from_rgb(13, 15, 22);
-        v.window_fill = Color32::from_rgb(20, 24, 35);
-        v.extreme_bg_color = Color32::from_rgb(18, 22, 32);
-        v.faint_bg_color = Color32::from_rgb(24, 28, 40);
-        v.widgets.noninteractive.bg_fill = Color32::from_rgb(24, 28, 40);
-        v.widgets.noninteractive.bg_stroke =
-            egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 46, 65));
-        v.widgets.inactive.bg_fill = Color32::from_rgb(30, 35, 50);
-        v.widgets.hovered.bg_fill = Color32::from_rgb(40, 48, 68);
-        v.selection.bg_fill = AEGIS_BLUE;
-        v
-    } else {
-        let mut v = egui::Visuals::light();
-        v.panel_fill = Color32::from_rgb(244, 246, 250);
-        v.window_fill = Color32::WHITE;
-        v.selection.bg_fill = AEGIS_BLUE;
-        v
+/// Language drop-down with a "system language" entry. Returns true if the language changed.
+fn language_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    config: &mut AppConfig,
+    lang: &mut Lang,
+    system_label: &str,
+) -> bool {
+    let current = match &config.language {
+        None => system_label.to_string(),
+        Some(code) => Lang::from_code(code).native_name().to_string(),
     };
+    let mut choice: Option<Option<Lang>> = None;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(current)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(config.language.is_none(), system_label).clicked() {
+                choice = Some(None);
+            }
+            for l in Lang::ALL {
+                let sel = config.language.as_deref() == Some(l.code());
+                if ui.selectable_label(sel, l.native_name()).clicked() {
+                    choice = Some(Some(l));
+                }
+            }
+        });
+    if let Some(c) = choice {
+        match c {
+            None => {
+                config.language = None;
+                *lang = Lang::detect_system();
+            }
+            Some(l) => {
+                config.language = Some(l.code().to_string());
+                *lang = l;
+            }
+        }
+        config.save();
+        return true;
+    }
+    false
+}
+
+fn install_fonts(ctx: &egui::Context) {
+    let candidates = [
+        "/usr/share/fonts/inter/Inter-Regular.ttf",
+        "/usr/share/fonts/TTF/Inter-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+    ];
+    for path in candidates {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("ui_font".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "ui_font".into());
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, dark_mode: bool) {
+    let t = tokens(dark_mode);
+    let mut style = (*ctx.style()).clone();
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.interact_size.y = 30.0;
+    style.spacing.menu_margin = egui::Margin::same(6);
+    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(13.5));
+    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(11.5));
+    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+    let mut v = if dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.panel_fill = t.bg;
+    v.window_fill = t.card;
+    v.extreme_bg_color = t.field;
+    v.faint_bg_color = t.chip;
+    v.window_corner_radius = egui::CornerRadius::same(16);
+    v.menu_corner_radius = egui::CornerRadius::same(12);
+    v.window_stroke = egui::Stroke::new(1.0_f32, t.border);
+    v.override_text_color = Some(t.text);
+    let r = egui::CornerRadius::same(10);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = r;
+        w.bg_stroke = egui::Stroke::NONE;
+    }
+    v.widgets.noninteractive.bg_fill = t.card;
+    v.widgets.inactive.bg_fill = t.chip;
+    v.widgets.inactive.weak_bg_fill = t.chip;
+    v.widgets.hovered.bg_fill = t.chip_hover;
+    v.widgets.hovered.weak_bg_fill = t.chip_hover;
+    v.widgets.active.bg_fill = t.chip_hover;
+    v.widgets.active.weak_bg_fill = t.chip_hover;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(32, 149, 242, 120);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, AEGIS_BLUE);
+    style.visuals = v;
     ctx.set_style(style);
 }

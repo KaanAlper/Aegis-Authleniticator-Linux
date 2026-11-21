@@ -9,6 +9,13 @@ mod vault;
 use app::AegisApp;
 
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--tray-only") {
+        tray::run_tray_only();
+        return Ok(());
+    }
+    // A window is starting: drop any background tray process left from "close to tray".
+    tray::stop_background_tray();
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Aegis Authenticator")
         .with_inner_size([720.0, 620.0])
