@@ -9,11 +9,11 @@ use base64::Engine;
 use egui::{Color32, ColorImage, RichText, TextureHandle, TextureOptions, Vec2};
 use uuid::Uuid;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SortMode};
 use crate::i18n::{strings, Lang};
 use crate::otp::{
-    current_unix_millis, current_unix_seconds, decode_qr_from_image, format_code_display,
-    generate_code_for_entry, parse_otpauth_uri,
+    current_unix_millis, current_unix_seconds, decode_qr_from_image, export_google_auth_migration,
+    export_html, export_txt, format_code_display, generate_code_for_entry, parse_otpauth_uri,
 };
 use crate::tray::{spawn_tray, AegisTray, SharedTrayState, TrayCommand};
 use crate::ui::widgets::{
@@ -30,6 +30,22 @@ enum FilterMode {
     All,
     Favorites,
     Group(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    Appearance,
+    Security,
+    Backups,
+    ImportExport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    AegisJson,
+    WebHtml,
+    TextTxt,
+    GoogleAuth,
 }
 
 struct Toast {
@@ -236,6 +252,10 @@ pub struct AegisApp {
     last_tray_sync_sec: u64,
     app_logo: Option<TextureHandle>,
     lang: Lang,
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    export_format: ExportFormat,
+    last_activity: Instant,
 }
 
 impl AegisApp {
@@ -318,6 +338,10 @@ impl AegisApp {
             last_tray_sync_sec: 0,
             app_logo,
             lang,
+            settings_open: false,
+            settings_tab: SettingsTab::Appearance,
+            export_format: ExportFormat::AegisJson,
+            last_activity: Instant::now(),
         };
 
         // If last vault is plaintext, auto-open it
@@ -456,10 +480,40 @@ impl AegisApp {
             Ok(()) => {
                 self.dirty = false;
                 self.show_toast("Vault saved", false);
+                self.maybe_run_auto_backup();
             }
             Err(e) => {
                 self.show_toast(format!("Failed to save vault: {e}"), true);
             }
+        }
+    }
+
+    fn run_backup_now(&mut self) -> Result<PathBuf, String> {
+        let Some(vault) = &self.vault else {
+            return Err("Vault is locked".into());
+        };
+        let dir = self
+            .config
+            .backup_dir
+            .clone()
+            .or_else(|| dirs::data_local_dir().map(|d| d.join("aegis-linux").join("backups")))
+            .ok_or_else(|| "No backup directory configured".to_string())?;
+        let ts = current_unix_seconds();
+        let dest = dir.join(format!("aegis-backup-{ts}.json"));
+        vault.save_to_path(&dest).map_err(|e| e.to_string())?;
+        self.config.last_backup_epoch = ts;
+        self.config.save();
+        Ok(dest)
+    }
+
+    fn maybe_run_auto_backup(&mut self) {
+        if !self.config.auto_backup_enabled || self.vault.is_none() {
+            return;
+        }
+        let now = current_unix_seconds();
+        let interval_secs = u64::from(self.config.backup_interval_days.max(1)) * 86_400;
+        if now.saturating_sub(self.config.last_backup_epoch) >= interval_secs {
+            let _ = self.run_backup_now();
         }
     }
 
@@ -617,6 +671,16 @@ impl AegisApp {
 
                             if self.pending_encrypted {
                                 ui.label(s.master_password);
+                                if !self.config.password_hint.trim().is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Hint: {}",
+                                            self.config.password_hint.trim()
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                }
                                 ui.add_space(4.0);
                                 let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.unlock_password)
@@ -757,6 +821,9 @@ impl AegisApp {
                             self.lock_vault();
                             return;
                         }
+                        if secondary_button(ui, s.settings).clicked() {
+                            self.settings_open = !self.settings_open;
+                        }
                         ui.menu_button(s.vault_menu, |ui| {
                             if ui.button(s.save_ctrl_s).clicked() {
                                 self.save_vault();
@@ -812,6 +879,34 @@ impl AegisApp {
                         self.search_query.clear();
                     }
 
+                    let sort_lbl = match self.config.sort_mode {
+                        SortMode::Default => s.sort_default,
+                        SortMode::IssuerAsc => s.sort_issuer_az,
+                        SortMode::IssuerDesc => s.sort_issuer_za,
+                        SortMode::NameAsc => s.sort_name_az,
+                        SortMode::NameDesc => s.sort_name_za,
+                        SortMode::FavoritesFirst => s.sort_fav_first,
+                    };
+                    egui::ComboBox::from_id_salt("sort_combo")
+                        .selected_text(format!("{}: {}", s.sort_label, sort_lbl))
+                        .show_ui(ui, |ui| {
+                            for (mode, lbl) in [
+                                (SortMode::Default, s.sort_default),
+                                (SortMode::IssuerAsc, s.sort_issuer_az),
+                                (SortMode::IssuerDesc, s.sort_issuer_za),
+                                (SortMode::NameAsc, s.sort_name_az),
+                                (SortMode::NameDesc, s.sort_name_za),
+                                (SortMode::FavoritesFirst, s.sort_fav_first),
+                            ] {
+                                if ui
+                                    .selectable_value(&mut self.config.sort_mode, mode, lbl)
+                                    .clicked()
+                                {
+                                    self.config.save();
+                                }
+                            }
+                        });
+
                     ui.add_space(6.0);
                     egui::ScrollArea::horizontal().show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -857,7 +952,7 @@ impl AegisApp {
                     .map(|v| v.db.entries.clone())
                     .unwrap_or_default();
 
-                let filtered: Vec<VaultEntry> = entries_snapshot
+                let mut filtered: Vec<VaultEntry> = entries_snapshot
                     .into_iter()
                     .filter(|e| match &self.filter_mode {
                         FilterMode::All => true,
@@ -873,6 +968,38 @@ impl AegisApp {
                             || e.note.to_ascii_lowercase().contains(&query)
                     })
                     .collect();
+
+                match self.config.sort_mode {
+                    SortMode::Default => {}
+                    SortMode::IssuerAsc => filtered.sort_by(|a, b| {
+                        a.issuer
+                            .to_ascii_lowercase()
+                            .cmp(&b.issuer.to_ascii_lowercase())
+                            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                    }),
+                    SortMode::IssuerDesc => filtered.sort_by(|a, b| {
+                        b.issuer
+                            .to_ascii_lowercase()
+                            .cmp(&a.issuer.to_ascii_lowercase())
+                    }),
+                    SortMode::NameAsc => filtered.sort_by(|a, b| {
+                        a.name
+                            .to_ascii_lowercase()
+                            .cmp(&b.name.to_ascii_lowercase())
+                    }),
+                    SortMode::NameDesc => filtered.sort_by(|a, b| {
+                        b.name
+                            .to_ascii_lowercase()
+                            .cmp(&a.name.to_ascii_lowercase())
+                    }),
+                    SortMode::FavoritesFirst => filtered.sort_by(|a, b| {
+                        b.favorite.cmp(&a.favorite).then_with(|| {
+                            a.issuer
+                                .to_ascii_lowercase()
+                                .cmp(&b.issuer.to_ascii_lowercase())
+                        })
+                    }),
+                }
 
                 if filtered.is_empty() {
                     ui.vertical_centered(|ui| {
@@ -939,14 +1066,16 @@ impl AegisApp {
 
                                         // Card Top Row: Avatar + Title + Actions
                                         ui.horizontal(|ui| {
-                                            draw_issuer_avatar(
-                                                ui,
-                                                &entry.issuer,
-                                                &entry.name,
-                                                texture.as_ref(),
-                                                38.0,
-                                            );
-                                            ui.add_space(6.0);
+                                            if self.config.show_icons {
+                                                draw_issuer_avatar(
+                                                    ui,
+                                                    &entry.issuer,
+                                                    &entry.name,
+                                                    texture.as_ref(),
+                                                    38.0,
+                                                );
+                                                ui.add_space(6.0);
+                                            }
                                             ui.vertical(|ui| {
                                                 let title = if entry.issuer.is_empty() {
                                                     entry.name.as_str()
@@ -1598,6 +1727,351 @@ impl AegisApp {
                     });
                 });
         }
+
+        // 6. Settings Modal (Appearance, Security, Backups, Import / Export)
+        if self.settings_open {
+            let mut open = true;
+            let mut close_for_groups = false;
+            let mut close_for_security = false;
+            let mut do_backup_now = false;
+            let mut do_import_json = false;
+            let mut do_import_txt = false;
+            let mut do_export = false;
+
+            egui::Window::new(s.settings)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(470.0);
+                    ui.horizontal(|ui| {
+                        for (tab, lbl) in [
+                            (SettingsTab::Appearance, s.tab_appearance),
+                            (SettingsTab::Security, s.tab_security),
+                            (SettingsTab::Backups, s.tab_backups),
+                            (SettingsTab::ImportExport, s.tab_import_export),
+                        ] {
+                            if filter_pill(ui, self.settings_tab == tab, lbl).clicked() {
+                                self.settings_tab = tab;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    match self.settings_tab {
+                        SettingsTab::Appearance => {
+                            egui::Grid::new("settings_app_grid")
+                                .num_columns(2)
+                                .spacing([16.0, 10.0])
+                                .show(ui, |ui| {
+                                    ui.label(s.theme_label);
+                                    ui.horizontal(|ui| {
+                                        if filter_pill(ui, self.config.dark_mode, "Dark").clicked()
+                                        {
+                                            self.config.dark_mode = true;
+                                            apply_theme(ctx, true);
+                                            self.config.save();
+                                        }
+                                        if filter_pill(ui, !self.config.dark_mode, "Light")
+                                            .clicked()
+                                        {
+                                            self.config.dark_mode = false;
+                                            apply_theme(ctx, false);
+                                            self.config.save();
+                                        }
+                                    });
+                                    ui.end_row();
+
+                                    ui.label(s.language_label);
+                                    ui.horizontal(|ui| {
+                                        if filter_pill(ui, self.lang == Lang::En, "English")
+                                            .clicked()
+                                        {
+                                            self.lang = Lang::En;
+                                            self.config.language = Some("en".into());
+                                            self.config.save();
+                                            self.sync_tray();
+                                        }
+                                        if filter_pill(ui, self.lang == Lang::Tr, "Türkçe")
+                                            .clicked()
+                                        {
+                                            self.lang = Lang::Tr;
+                                            self.config.language = Some("tr".into());
+                                            self.config.save();
+                                            self.sync_tray();
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
+
+                            ui.add_space(8.0);
+                            if ui
+                                .checkbox(&mut self.config.show_icons, s.show_icons_label)
+                                .changed()
+                            {
+                                self.config.save();
+                            }
+                            ui.add_space(10.0);
+                            if secondary_button(ui, s.manage_groups).clicked() {
+                                close_for_groups = true;
+                            }
+                        }
+                        SettingsTab::Security => {
+                            if secondary_button(ui, s.encryption_pwd).clicked() {
+                                close_for_security = true;
+                            }
+                            ui.add_space(12.0);
+                            ui.label(s.password_hint_label);
+                            ui.add_space(4.0);
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut self.config.password_hint)
+                                        .desired_width(f32::INFINITY),
+                                )
+                                .changed()
+                            {
+                                self.config.save();
+                            }
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.label(s.auto_lock_label);
+                                let mut mins = self.config.auto_lock_mins as u32;
+                                if ui
+                                    .add(egui::DragValue::new(&mut mins).range(0..=240))
+                                    .changed()
+                                {
+                                    self.config.auto_lock_mins = u64::from(mins);
+                                    self.config.save();
+                                }
+                            });
+                        }
+                        SettingsTab::Backups => {
+                            if ui
+                                .checkbox(
+                                    &mut self.config.auto_backup_enabled,
+                                    s.auto_backup_label,
+                                )
+                                .changed()
+                            {
+                                self.config.save();
+                            }
+                            ui.add_space(8.0);
+                            ui.label(s.backup_dir_label);
+                            ui.horizontal(|ui| {
+                                let dir_str = self
+                                    .config
+                                    .backup_dir
+                                    .as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default();
+                                ui.label(RichText::new(dir_str).small().weak());
+                                if secondary_button(ui, s.choose_folder).clicked() {
+                                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                        self.config.backup_dir = Some(folder);
+                                        self.config.save();
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.label(s.backup_days_label);
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut self.config.backup_interval_days)
+                                            .range(1..=365),
+                                    )
+                                    .changed()
+                                {
+                                    self.config.save();
+                                }
+                            });
+                            ui.add_space(12.0);
+                            if primary_button(ui, s.backup_now).clicked() {
+                                do_backup_now = true;
+                            }
+                        }
+                        SettingsTab::ImportExport => {
+                            ui.label(RichText::new(s.import_from_file).strong());
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if secondary_button(ui, s.import_aegis_json).clicked() {
+                                    do_import_json = true;
+                                }
+                                if secondary_button(ui, s.import_txt_uris).clicked() {
+                                    do_import_txt = true;
+                                }
+                            });
+                            ui.add_space(14.0);
+                            ui.separator();
+                            ui.add_space(10.0);
+                            ui.label(RichText::new(s.export_to).strong());
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(s.export_format);
+                                let fmt_label = match self.export_format {
+                                    ExportFormat::AegisJson => "Aegis (.json)",
+                                    ExportFormat::WebHtml => "Web (.html)",
+                                    ExportFormat::TextTxt => "Text (.txt)",
+                                    ExportFormat::GoogleAuth => "Google Authenticator",
+                                };
+                                egui::ComboBox::from_id_salt("export_fmt_combo")
+                                    .selected_text(fmt_label)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.export_format,
+                                            ExportFormat::AegisJson,
+                                            "Aegis (.json)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.export_format,
+                                            ExportFormat::WebHtml,
+                                            "Web (.html)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.export_format,
+                                            ExportFormat::TextTxt,
+                                            "Text (.txt)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.export_format,
+                                            ExportFormat::GoogleAuth,
+                                            "Google Authenticator",
+                                        );
+                                    });
+                            });
+                            ui.add_space(10.0);
+                            if primary_button(ui, s.export_btn).clicked() {
+                                do_export = true;
+                            }
+                        }
+                    }
+                });
+
+            if !open {
+                self.settings_open = false;
+            }
+            if close_for_groups {
+                self.settings_open = false;
+                self.groups_modal_open = true;
+            }
+            if close_for_security {
+                self.settings_open = false;
+                self.security_modal_open = true;
+                self.sec_new_password.clear();
+                self.sec_confirm_password.clear();
+            }
+            if do_backup_now {
+                match self.run_backup_now() {
+                    Ok(p) => self.show_toast(format!("Backup saved: {}", p.display()), false),
+                    Err(e) => self.show_toast(e, true),
+                }
+            }
+            if do_import_json {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Aegis JSON", &["json"])
+                    .pick_file()
+                {
+                    match load_vault(&path, None) {
+                        Ok(imported_v) => {
+                            let mut count = 0usize;
+                            if let Some(v) = &mut self.vault {
+                                for e in imported_v.db.entries {
+                                    if !v.db.entries.iter().any(|x| x.uuid == e.uuid) {
+                                        v.db.entries.push(e);
+                                        count += 1;
+                                    }
+                                }
+                                self.dirty = count > 0;
+                            }
+                            self.sync_tray();
+                            self.show_toast(format!("Imported {count} entry(s)"), false);
+                        }
+                        Err(e) => self.show_toast(e.to_string(), true),
+                    }
+                }
+            }
+            if do_import_txt {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Text / URI", &["txt"])
+                    .pick_file()
+                {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let mut count = 0usize;
+                        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                            if let Ok(entry) = parse_otpauth_uri(line) {
+                                if let Some(v) = &mut self.vault {
+                                    v.db.entries.push(entry);
+                                    count += 1;
+                                }
+                            }
+                        }
+                        if count > 0 {
+                            self.dirty = true;
+                            self.sync_tray();
+                        }
+                        self.show_toast(format!("Imported {count} URI(s)"), false);
+                    }
+                }
+            }
+            if do_export {
+                if let Some(v) = &self.vault {
+                    let entries = v.db.entries.clone();
+                    match self.export_format {
+                        ExportFormat::AegisJson => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Aegis JSON", &["json"])
+                                .set_file_name("aegis-export.json")
+                                .save_file()
+                            {
+                                match v.save_to_path(&path) {
+                                    Ok(()) => self.show_toast("Exported Aegis JSON", false),
+                                    Err(e) => self.show_toast(e.to_string(), true),
+                                }
+                            }
+                        }
+                        ExportFormat::WebHtml => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("HTML", &["html"])
+                                .set_file_name("aegis-export.html")
+                                .save_file()
+                            {
+                                let html = export_html(&entries);
+                                match std::fs::write(&path, html) {
+                                    Ok(()) => self.show_toast("Exported Web HTML", false),
+                                    Err(e) => self.show_toast(e.to_string(), true),
+                                }
+                            }
+                        }
+                        ExportFormat::TextTxt => {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Text", &["txt"])
+                                .set_file_name("aegis-export.txt")
+                                .save_file()
+                            {
+                                let txt = export_txt(&entries);
+                                match std::fs::write(&path, txt) {
+                                    Ok(()) => self.show_toast("Exported Text URIs", false),
+                                    Err(e) => self.show_toast(e.to_string(), true),
+                                }
+                            }
+                        }
+                        ExportFormat::GoogleAuth => {
+                            let migration_uri = export_google_auth_migration(&entries);
+                            self.copy_to_clipboard(&migration_uri, "Google Auth Migration URI");
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Text", &["txt"])
+                                .set_file_name("google-auth-migration.txt")
+                                .save_file()
+                            {
+                                let _ = std::fs::write(&path, &migration_uri);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1628,6 +2102,17 @@ impl eframe::App for AegisApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // Track activity for auto-lock
+        if ctx.input(|i| !i.events.is_empty()) {
+            self.last_activity = Instant::now();
+        }
+        if self.vault.is_some()
+            && self.config.auto_lock_mins > 0
+            && self.last_activity.elapsed() >= Duration::from_secs(self.config.auto_lock_mins * 60)
+        {
+            self.lock_vault();
         }
 
         // Periodically refresh tray menu OTP codes when unlocked

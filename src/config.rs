@@ -3,6 +3,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Default,
+    IssuerAsc,
+    IssuerDesc,
+    NameAsc,
+    NameDesc,
+    FavoritesFirst,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub last_vault_path: Option<PathBuf>,
@@ -10,10 +21,34 @@ pub struct AppConfig {
     pub dark_mode: bool,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub sort_mode: SortMode,
+    #[serde(default = "default_show_icons")]
+    pub show_icons: bool,
+    #[serde(default)]
+    pub password_hint: String,
+    #[serde(default)]
+    pub auto_lock_mins: u64,
+    #[serde(default)]
+    pub auto_backup_enabled: bool,
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
+    #[serde(default = "default_backup_days")]
+    pub backup_interval_days: u32,
+    #[serde(default)]
+    pub last_backup_epoch: u64,
 }
 
 fn default_dark_mode() -> bool {
     true
+}
+
+fn default_show_icons() -> bool {
+    true
+}
+
+fn default_backup_days() -> u32 {
+    7
 }
 
 impl Default for AppConfig {
@@ -22,6 +57,14 @@ impl Default for AppConfig {
             last_vault_path: None,
             dark_mode: true,
             language: None,
+            sort_mode: SortMode::Default,
+            show_icons: true,
+            password_hint: String::new(),
+            auto_lock_mins: 0,
+            auto_backup_enabled: false,
+            backup_dir: dirs::data_local_dir().map(|d| d.join("aegis-linux").join("backups")),
+            backup_interval_days: 7,
+            last_backup_epoch: 0,
         }
     }
 }

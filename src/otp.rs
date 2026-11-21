@@ -339,6 +339,175 @@ pub fn decode_qr_from_image(path: &std::path::Path) -> Result<String, String> {
     Err("No valid QR code found in image".to_string())
 }
 
+pub fn entry_to_otpauth_uri(entry: &VaultEntry) -> String {
+    let typ = match entry.entry_type {
+        OtpType::Totp => "totp",
+        OtpType::Hotp => "hotp",
+        OtpType::Steam => "steam",
+        OtpType::Motp => "motp",
+        OtpType::Yandex => "yaotp",
+    };
+    let label = if entry.issuer.is_empty() {
+        entry.name.clone()
+    } else if entry.name.is_empty() {
+        entry.issuer.clone()
+    } else {
+        format!("{}:{}", entry.issuer, entry.name)
+    };
+    let enc_label: String = url::form_urlencoded::byte_serialize(label.as_bytes()).collect();
+    let mut params = vec![
+        format!("secret={}", entry.info.secret),
+        format!("algorithm={}", entry.info.algo),
+        format!("digits={}", entry.info.digits),
+    ];
+    if !entry.issuer.is_empty() {
+        let enc_iss: String =
+            url::form_urlencoded::byte_serialize(entry.issuer.as_bytes()).collect();
+        params.push(format!("issuer={enc_iss}"));
+    }
+    if entry.entry_type == OtpType::Hotp {
+        params.push(format!("counter={}", entry.info.counter.unwrap_or(0)));
+    } else if let Some(p) = entry.info.period {
+        params.push(format!("period={p}"));
+    }
+    format!("otpauth://{typ}/{enc_label}?{}", params.join("&"))
+}
+
+pub fn export_txt(entries: &[VaultEntry]) -> String {
+    entries
+        .iter()
+        .map(entry_to_otpauth_uri)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn export_html(entries: &[VaultEntry]) -> String {
+    let mut rows = String::new();
+    for e in entries {
+        let uri = entry_to_otpauth_uri(e);
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td></tr>\n",
+            html_escape(&e.issuer),
+            html_escape(&e.name),
+            e.entry_type.label(),
+            html_escape(&e.info.secret),
+            html_escape(&uri),
+        ));
+    }
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Aegis Vault Export</title>
+<style>
+body {{ font-family: system-ui, sans-serif; background: #0d0f16; color: #e2e8f0; padding: 2rem; }}
+h1 {{ color: #2095f2; }}
+table {{ width: 100%; border-collapse: collapse; margin-top: 1rem; }}
+th, td {{ border: 1px solid #282e41; padding: 10px; text-align: left; font-size: 13px; }}
+th {{ background: #181c28; }}
+code {{ word-break: break-all; color: #93c5fd; }}
+</style>
+</head>
+<body>
+<h1>Aegis Authenticator Export</h1>
+<p>Total entries: {}</p>
+<table>
+<thead><tr><th>Issuer</th><th>Account</th><th>Type</th><th>Secret</th><th>otpauth URI</th></tr></thead>
+<tbody>
+{}
+</tbody>
+</table>
+</body>
+</html>"#,
+        entries.len(),
+        rows
+    )
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Encodes entries into Google Authenticator's `otpauth-migration://offline?data=...` format.
+pub fn export_google_auth_migration(entries: &[VaultEntry]) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+
+    fn write_varint(buf: &mut Vec<u8>, mut val: u64) {
+        loop {
+            let mut byte = (val & 0x7f) as u8;
+            val >>= 7;
+            if val != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if val == 0 {
+                break;
+            }
+        }
+    }
+
+    fn write_bytes_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+        write_varint(buf, u64::from((field << 3) | 2));
+        write_varint(buf, data.len() as u64);
+        buf.extend_from_slice(data);
+    }
+
+    fn write_varint_field(buf: &mut Vec<u8>, field: u32, val: u64) {
+        if val != 0 {
+            write_varint(buf, u64::from(field << 3));
+            write_varint(buf, val);
+        }
+    }
+
+    let mut payload = Vec::new();
+    for e in entries {
+        let Ok(secret_bytes) = decode_base32_secret(&e.info.secret) else {
+            continue;
+        };
+        let mut otp_param = Vec::new();
+        write_bytes_field(&mut otp_param, 1, &secret_bytes);
+        let label = if e.issuer.is_empty() {
+            e.name.clone()
+        } else if e.name.is_empty() {
+            e.issuer.clone()
+        } else {
+            format!("{}:{}", e.issuer, e.name)
+        };
+        write_bytes_field(&mut otp_param, 2, label.as_bytes());
+        if !e.issuer.is_empty() {
+            write_bytes_field(&mut otp_param, 3, e.issuer.as_bytes());
+        }
+        let algo_num = match e.info.algo.to_ascii_uppercase().as_str() {
+            "SHA256" => 2,
+            "SHA512" => 3,
+            "MD5" => 4,
+            _ => 1,
+        };
+        write_varint_field(&mut otp_param, 4, algo_num);
+        let digits_num = if e.info.digits == 8 { 2 } else { 1 };
+        write_varint_field(&mut otp_param, 5, digits_num);
+        let type_num = if e.entry_type == OtpType::Hotp { 1 } else { 2 };
+        write_varint_field(&mut otp_param, 6, type_num);
+        if e.entry_type == OtpType::Hotp {
+            write_varint_field(&mut otp_param, 7, e.info.counter.unwrap_or(0));
+        }
+        write_bytes_field(&mut payload, 1, &otp_param);
+    }
+
+    write_varint_field(&mut payload, 2, 1); // version = 1
+    write_varint_field(&mut payload, 3, 1); // batch_size = 1
+    write_varint_field(&mut payload, 5, 1); // batch_id = 1
+
+    let b64 = BASE64.encode(payload);
+    let enc: String = url::form_urlencoded::byte_serialize(b64.as_bytes()).collect();
+    format!("otpauth-migration://offline?data={enc}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
