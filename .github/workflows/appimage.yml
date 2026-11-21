@@ -1,0 +1,92 @@
+name: AppImage
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    # Oldest LTS runner: the binary keeps working on older glibc versions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libdbus-1-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev libegl1-mesa-dev \
+            libx11-dev libgtk-3-dev libfuse2 file
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VERSION="${GITHUB_REF_NAME#v}"; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble AppDir
+        run: |
+          APPDIR=AppDir
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/aegis-linux "$APPDIR/usr/bin/aegis-linux"
+          cp assets/icon.png "$APPDIR/aegis-linux.png"
+          cp assets/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/aegis-linux.png"
+          cat > "$APPDIR/aegis-linux.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=Aegis Authenticator
+          Comment=Linux Desktop Client for Aegis 2FA Vaults
+          Exec=aegis-linux
+          Icon=aegis-linux
+          Terminal=false
+          Categories=Utility;Security;
+          Keywords=2FA;TOTP;HOTP;OTP;Aegis;Authenticator;
+          StartupNotify=true
+          DESKTOP
+          cp "$APPDIR/aegis-linux.desktop" "$APPDIR/usr/share/applications/"
+          cat > "$APPDIR/AppRun" <<'RUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/aegis-linux" "$@"
+          RUN
+          chmod +x "$APPDIR/AppRun"
+
+      - name: Build AppImage
+        env:
+          ARCH: x86_64
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ./appimagetool-x86_64.AppImage --appimage-extract-and-run AppDir \
+            "Aegis-Authenticator-${VERSION}-x86_64.AppImage"
+          sha256sum Aegis-Authenticator-*.AppImage > SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Aegis-Authenticator-AppImage
+          path: |
+            Aegis-Authenticator-*.AppImage
+            SHA256SUMS.txt
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Aegis-Authenticator-*.AppImage
+            SHA256SUMS.txt
+          generate_release_notes: true

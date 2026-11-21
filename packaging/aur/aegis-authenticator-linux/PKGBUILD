@@ -1,0 +1,45 @@
+# Maintainer: KaanAlper
+pkgname=aegis-authenticator-linux
+pkgver=0.2.0
+pkgrel=1
+pkgdesc='Native Linux desktop client for Aegis Authenticator 2FA vaults, written in Rust'
+arch=('x86_64' 'aarch64')
+url='https://github.com/KaanAlper/Aegis-Authleniticator-Linux'
+license=('custom')
+depends=('dbus' 'libxkbcommon' 'wayland' 'gtk3' 'libnotify' 'mesa')
+optdepends=('wl-clipboard: most reliable clipboard on Wayland'
+            'zbar: webcam QR scanning')
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # replace with the real checksum: updpkgsums
+
+prepare() {
+  cd "Aegis-Authleniticator-Linux-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "Aegis-Authleniticator-Linux-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release
+}
+
+package() {
+  cd "Aegis-Authleniticator-Linux-$pkgver"
+  install -Dm755 target/release/aegis-linux "$pkgdir/usr/bin/aegis-linux"
+  install -Dm644 assets/icon.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/aegis-linux.png"
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/applications/aegis-linux.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Aegis Authenticator
+Comment=Linux Desktop Client for Aegis 2FA Vaults
+Exec=aegis-linux
+Icon=aegis-linux
+Terminal=false
+Categories=Utility;Security;
+Keywords=2FA;TOTP;HOTP;OTP;Aegis;Authenticator;
+StartupNotify=true
+DESKTOP
+}
