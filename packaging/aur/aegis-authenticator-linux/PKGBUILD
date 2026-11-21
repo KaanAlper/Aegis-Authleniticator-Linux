@@ -11,7 +11,7 @@ optdepends=('wl-clipboard: most reliable clipboard on Wayland'
             'zbar: webcam QR scanning')
 makedepends=('cargo' 'pkgconf')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP') # replace with the real checksum: updpkgsums
+sha256sums=('3e5e730e07e67a6dfd33795ee19ad70e27265dfa45733604d47c1c552b8ce7da')
 
 prepare() {
   cd "Aegis-Authleniticator-Linux-$pkgver"

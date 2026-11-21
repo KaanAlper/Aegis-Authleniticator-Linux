@@ -16,7 +16,8 @@ options=('!strip')
 source=("Aegis-Authenticator-$pkgver-x86_64.AppImage::$url/releases/download/v$pkgver/Aegis-Authenticator-$pkgver-x86_64.AppImage"
         "$_pkgname.png::$url/raw/v$pkgver/assets/icon.png")
 noextract=("Aegis-Authenticator-$pkgver-x86_64.AppImage")
-sha256sums=('SKIP' 'SKIP') # replace with real checksums: updpkgsums
+sha256sums=('904632eafe8aa7072868402529c3ec65abe3dbf35010cf73ff03eea5c2a46c88'
+            'f41992d7dde755c365c83c8bc2e19ac3c3cd183a4c4ad0d36b86b3ec35f56918')
 
 package() {
   install -Dm755 "Aegis-Authenticator-$pkgver-x86_64.AppImage" "$pkgdir/opt/$_pkgname/$_pkgname.AppImage"
